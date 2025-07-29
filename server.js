@@ -58,6 +58,23 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+// Root endpoint for development
+app.get('/', (req, res) => {
+  res.json({
+    message: 'AI Feature Prioritization API',
+    version: '1.0.0',
+    endpoints: {
+      health: '/api/health',
+      jira: '/api/jira',
+      projects: '/api/projects',
+      ranking: '/api/ranking',
+      auth: '/api/auth',
+      ai: '/api/ai'
+    },
+    frontend: process.env.NODE_ENV === 'production' ? 'Served from /build' : 'Run `npm start` in /client folder on port 3000'
+  });
+});
+
 // Error handling middleware
 app.use((err, req, res, next) => {
   console.error(err.stack);
