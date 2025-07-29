@@ -1,6 +1,7 @@
 const JobQueue = require('./jobQueue');
 const OllamaService = require('./ollamaService');
 const { dbHelpers } = require('../database/init');
+const config = require('../config');
 
 class AIJobQueue extends JobQueue {
   constructor() {

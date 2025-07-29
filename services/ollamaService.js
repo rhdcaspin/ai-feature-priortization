@@ -1,7 +1,8 @@
 const axios = require('axios');
+const config = require('../config');
 
 class OllamaService {
-  constructor(baseUrl = 'http://localhost:11434', model = 'llama3:latest') {
+  constructor(baseUrl = config.ai.ollamaBaseUrl, model = config.ai.ollamaModel) {
     this.baseUrl = baseUrl;
     this.model = model;
     this.client = axios.create({
