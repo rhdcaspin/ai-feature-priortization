@@ -1,6 +1,6 @@
-# Daily ROX Feature Validation
+# ROX Feature Validation Tool
 
-This guide explains how to set up and run daily validation for ROX 4.10 features, including automatic template compliance comments.
+This guide explains how to use the ROX feature validation tool for analyzing ROX 4.10 features, including template validation and optional comment functionality.
 
 ## 🚀 Quick Start
 
@@ -24,10 +24,13 @@ python3 daily_validation.py --dry-run
 python3 daily_validation.py --skip-comments
 ```
 
-### 3. Run Daily Validation
+### 3. Run Feature Validation
 
 ```bash
-# Full validation (generates report + adds comments)
+# Safe dry run (generates report + shows what comments would be added)
+python3 daily_validation.py --dry-run
+
+# Full validation (generates report + adds comments when confirmed)
 python3 daily_validation.py
 ```
 

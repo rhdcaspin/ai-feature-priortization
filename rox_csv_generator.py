@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """
-ROX 4.10 Feature CSV Generator with AI Analysis
+ROX 4.10 Feature CSV Generator with AI Analysis and Template Validation
 
 This script connects to Red Hat Jira, retrieves ROX 4.10 features,
 validates them against a template, performs AI analysis using Ollama,
-and generates a comprehensive CSV report.
+and generates a comprehensive CSV report. It can also add comments to 
+features with missing template sections when explicitly requested.
+
+Features:
+- Template validation with regex patterns for Jira wiki markup
+- AI analysis using local Ollama service with caching
+- Jira comment functionality for template compliance
+- Comprehensive CSV reporting with compliance scoring
 
 Author: AI Assistant
 Date: September 2024
@@ -52,7 +59,7 @@ class TemplateSection:
         return len(cleaned) > 10  # Require at least some meaningful content
 
 
-@dataclass 
+@dataclass
 class GenAIValidationResult:
     """Results from GenAI feature validation"""
     engineering_score: int  # 1-5 scale (5 = highest quality)
@@ -63,7 +70,7 @@ class GenAIValidationResult:
 
 
 class ROXFeatureReporter:
-    """Enhanced reporter for ROX features with AI validation"""
+    """ROX Feature Reporter with AI analysis, template validation, and commenting capabilities"""
     
     def __init__(self, jira_url: str, api_token: str, ollama_url: str = None, ollama_model: str = "LLama3.1:8b"):
         self.jira_url = jira_url.rstrip('/')

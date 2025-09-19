@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-Daily ROX Feature Validation Script
+ROX Feature Validation Script
 
-This script runs the daily validation process:
+This script runs the validation process on-demand:
 1. Generates feature analysis report with AI validation
-2. Adds template compliance comments to incomplete features
-3. Can be run as a cron job or scheduled task
+2. Optionally adds template compliance comments to incomplete features
+3. Can be run manually or as a scheduled task
+
+Usage:
+- python3 daily_validation.py --dry-run  # Preview what would happen
+- python3 daily_validation.py            # Generate report with comments
 
 Author: AI Assistant  
 Date: September 2024
@@ -27,7 +31,7 @@ def run_daily_validation(dry_run: bool = False, skip_comments: bool = False):
         skip_comments: If True, skip adding comments entirely
     """
     
-    print("🌅 Starting Daily ROX Feature Validation")
+    print("🚀 Starting ROX Feature Validation")
     print("=" * 50)
     print(f"📅 Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"🔧 Mode: {'DRY RUN' if dry_run else 'LIVE'}")
@@ -67,7 +71,7 @@ def run_daily_validation(dry_run: bool = False, skip_comments: bool = False):
         
         if result.returncode == 0:
             print("\n" + "=" * 50)
-            print("✅ Daily validation completed successfully!")
+            print("✅ Feature validation completed successfully!")
             
             if not skip_comments:
                 if dry_run:
@@ -80,37 +84,37 @@ def run_daily_validation(dry_run: bool = False, skip_comments: bool = False):
                 
         else:
             print("\n" + "=" * 50)
-            print(f"❌ Daily validation failed with exit code: {result.returncode}")
+            print(f"❌ Feature validation failed with exit code: {result.returncode}")
             return result.returncode
         
         return 0
         
     except KeyboardInterrupt:
-        print("\n🛑 Daily validation interrupted by user")
+        print("\n🛑 Feature validation interrupted by user")
         return 130
     except Exception as e:
-        print(f"\n❌ Error during daily validation: {e}")
+        print(f"\n❌ Error during feature validation: {e}")
         return 1
 
 
 def main():
     """Main function with command line argument parsing"""
     parser = argparse.ArgumentParser(
-        description='Daily ROX Feature Validation - Generates reports and adds template compliance comments',
+        description='ROX Feature Validation Tool - Generates reports and optionally adds template compliance comments',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Run full daily validation (generate report + add comments)
+  # Run validation with comment addition (requires confirmation)
   python3 daily_validation.py
   
-  # Dry run to see what comments would be added
+  # Dry run to see what comments would be added (safe)
   python3 daily_validation.py --dry-run
   
-  # Generate report only, skip comments
+  # Generate analysis report only, skip comments
   python3 daily_validation.py --skip-comments
   
-  # Set up as daily cron job (runs at 9 AM daily)
-  # 0 9 * * * cd /path/to/project && python3 daily_validation.py
+  # Can be scheduled if desired (runs at 9 AM daily)
+  # 0 9 * * * cd /path/to/project && python3 daily_validation.py --dry-run
         """
     )
     
