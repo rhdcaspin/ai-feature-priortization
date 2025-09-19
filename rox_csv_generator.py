@@ -196,12 +196,12 @@ class ROXFeatureReporter:
         
         sections = {}
         section_patterns = {
-            'Goal Summary': (True, r'Goal Summary:\s*(.*?)(?=\n\n(?:[A-Z][^:]*:|$))', re.DOTALL | re.IGNORECASE),
-            'Goals and expected user outcomes': (True, r'Goals and expected user outcomes:\s*(.*?)(?=\n\n(?:[A-Z][^:]*:|$))', re.DOTALL | re.IGNORECASE),
-            'Acceptance Criteria': (True, r'Acceptance Criteria:\s*(.*?)(?=\n\n(?:[A-Z][^:]*:|$))', re.DOTALL | re.IGNORECASE),
-            'Success Criteria or KPIs measured': (True, r'Success Criteria or KPIs measured:\s*(.*?)(?=\n\n(?:[A-Z][^:]*:|$))', re.DOTALL | re.IGNORECASE),
-            'Use Cases': (False, r'Use Cases.*?:\s*(.*?)(?=\n\n(?:[A-Z][^:]*:|$))', re.DOTALL | re.IGNORECASE),
-            'Out of Scope': (False, r'Out of Scope.*?:\s*(.*?)(?=\n\n(?:[A-Z][^:]*:|$))', re.DOTALL | re.IGNORECASE)
+            'Goal Summary': (True, r'(?:h3\.\s*)?\*?Goal Summary:?\*?\s*(.*?)(?=\n\s*(?:h3\.|\*?[A-Z][^:]*:?\*?|$))', re.DOTALL | re.IGNORECASE),
+            'Goals and expected user outcomes': (True, r'(?:h3\.\s*)?\*?Goals and expected user outcomes:?\*?\s*(.*?)(?=\n\s*(?:h3\.|\*?[A-Z][^:]*:?\*?|$))', re.DOTALL | re.IGNORECASE),
+            'Acceptance Criteria': (True, r'(?:h3\.\s*)?\*?Acceptance Criteria:?\*?\s*(.*?)(?=\n\s*(?:h3\.|\*?[A-Z][^:]*:?\*?|$))', re.DOTALL | re.IGNORECASE),
+            'Success Criteria or KPIs measured': (True, r'(?:h3\.\s*)?\*?Success Criteria or KPIs measured:?\*?\s*(.*?)(?=\n\s*(?:h3\.|\*?[A-Z][^:]*:?\*?|$))', re.DOTALL | re.IGNORECASE),
+            'Use Cases': (False, r'(?:h3\.\s*)?\*?Use Cases.*?:?\*?\s*(.*?)(?=\n\s*(?:h3\.|\*?[A-Z][^:]*:?\*?|$))', re.DOTALL | re.IGNORECASE),
+            'Out of Scope': (False, r'(?:h3\.\s*)?\*?Out of Scope.*?:?\*?\s*(.*?)(?=\n\s*(?:h3\.|\*?[A-Z][^:]*:?\*?|$))', re.DOTALL | re.IGNORECASE)
         }
         
         for section_name, (required, pattern, flags) in section_patterns.items():
