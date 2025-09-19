@@ -159,7 +159,7 @@ class ROXFeatureReporter:
                     'jql': jql,
                     'startAt': start_at,
                     'maxResults': max_results,
-                    'fields': 'summary,description,key,assignee,customfield_12316752,customfield_12319940,customfield_12311940,status,labels,issuelinks,subtasks,updated'
+                    'fields': 'summary,description,key,assignee,customfield_12316752,customfield_12319940,customfield_12311940,customfield_12313240,status,labels,issuelinks,subtasks,updated'
                 }
                 
                 api_version = getattr(self, 'api_version', '2')
@@ -378,7 +378,7 @@ class ROXFeatureReporter:
         """
         Calculate comprehensive compliance score (1-10) based on:
         - Template completeness
-        - Field assignments (PM, Assignee)
+        - Field assignments (PM, Assignee, Team)
         - LLM quality scores
         - Label compliance
         """
@@ -393,7 +393,8 @@ class ROXFeatureReporter:
         assignment_weight = 2.0
         pm_assigned = self.check_product_manager_assigned(feature)
         assignee_assigned = self.check_assignee_assigned(feature)
-        assignment_ratio = (int(pm_assigned) + int(assignee_assigned)) / 2.0
+        team_assigned = self.check_team_assigned(feature)
+        assignment_ratio = (int(pm_assigned) + int(assignee_assigned) + int(team_assigned)) / 3.0
         score += assignment_ratio * assignment_weight
         
         # 3. LLM Quality Scores (30% weight - 3 points max)
@@ -451,6 +452,25 @@ class ROXFeatureReporter:
             return len(assignee.strip()) > 0
         
         return assignee is not None
+
+    def check_team_assigned(self, feature: Dict) -> bool:
+        """Check if feature has a team assigned"""
+        fields = feature.get('fields', {})
+        team_field = fields.get('customfield_12313240')
+        
+        if isinstance(team_field, dict):
+            team_name = team_field.get('name', '').strip()
+            return bool(team_name)
+        elif isinstance(team_field, str):
+            return bool(team_field.strip())
+        elif isinstance(team_field, list) and team_field:
+            # Handle list of teams
+            return any(
+                team.get('name', '').strip() if isinstance(team, dict) else str(team).strip()
+                for team in team_field
+            )
+        
+        return False
 
     def _get_feature_hash(self, feature: Dict) -> str:
         """
@@ -680,6 +700,7 @@ Example: 4,3,5,4,4
             epic_count = self.count_related_epics(feature)
             pm_assigned = self.check_product_manager_assigned(feature)
             assignee_assigned = self.check_assignee_assigned(feature)
+            team_assigned = self.check_team_assigned(feature)
             compliance_score = self.calculate_compliance_score(feature, validation, genai_result)
             
             feature_data.append({
@@ -690,6 +711,7 @@ Example: 4,3,5,4,4
                 'epic_count': epic_count,
                 'pm_assigned': pm_assigned,
                 'assignee_assigned': assignee_assigned,
+                'team_assigned': team_assigned,
                 'compliance_score': compliance_score
             })
         
@@ -704,9 +726,9 @@ Example: 4,3,5,4,4
         # Write CSV
         fieldnames = [
             'Rank', 'Key', 'Summary', 'Status', 'Link',
-            'Assignee', 'Product_Manager', 'Target_Version',
+            'Assignee', 'Product_Manager', 'Team', 'Target_Version',
             'Template_Score', 'Required_Sections_Valid', 'Missing_Required',
-            'Has_410_Label', 'Related_Epics_Count', 'PM_Assigned', 'Assignee_Assigned',
+            'Has_410_Label', 'Related_Epics_Count', 'PM_Assigned', 'Assignee_Assigned', 'Team_Assigned',
             'GenAI_Overall', 'GenAI_Engineering', 'GenAI_Clarity', 'GenAI_Completeness', 'GenAI_Implementability',
             'Jira_Rank_Score', 'Compliance_Score'
         ]
@@ -748,6 +770,17 @@ Example: 4,3,5,4,4
                 else:
                     pm_name = 'Unassigned'
                 
+                # Handle Team field (customfield_12313240)
+                team = fields.get('customfield_12313240')
+                if isinstance(team, list) and team:
+                    team_name = team[0].get('name', 'Unassigned') if isinstance(team[0], dict) else str(team[0])
+                elif isinstance(team, dict):
+                    team_name = team.get('name', 'Unassigned')
+                elif isinstance(team, str):
+                    team_name = team
+                else:
+                    team_name = 'Unassigned'
+                
                 # Handle Target Version field
                 target_version = fields.get('customfield_12319940')
                 if isinstance(target_version, list) and target_version:
@@ -771,6 +804,7 @@ Example: 4,3,5,4,4
                     'Link': f"https://issues.redhat.com/browse/{feature.get('key', '')}",
                     'Assignee': assignee_name,
                     'Product_Manager': pm_name,
+                    'Team': team_name,
                     'Target_Version': version_name,
                     'Template_Score': validation.get('template_score', 0),
                     'Required_Sections_Valid': validation.get('required_sections_valid', 0),
@@ -779,6 +813,7 @@ Example: 4,3,5,4,4
                     'Related_Epics_Count': data['epic_count'],
                     'PM_Assigned': 'Yes' if data['pm_assigned'] else 'No',
                     'Assignee_Assigned': 'Yes' if data['assignee_assigned'] else 'No',
+                    'Team_Assigned': 'Yes' if data['team_assigned'] else 'No',
                     'GenAI_Overall': genai_result.overall_score,
                     'GenAI_Engineering': genai_result.engineering_score,
                     'GenAI_Clarity': genai_result.clarity_score,
