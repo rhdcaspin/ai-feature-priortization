@@ -197,7 +197,49 @@ class ROXFeatureReporter:
                 break
         
         print(f"✅ Total features retrieved: {len(all_issues)}")
-        return all_issues
+        
+        # Filter out features assigned to ACS PM team
+        filtered_issues = self._filter_acs_pm_team(all_issues)
+        if len(filtered_issues) != len(all_issues):
+            filtered_count = len(all_issues) - len(filtered_issues)
+            print(f"🚫 Filtered out {filtered_count} features assigned to ACS PM team")
+            print(f"📊 Final feature count: {len(filtered_issues)}")
+        
+        return filtered_issues
+
+    def _filter_acs_pm_team(self, issues: List[Dict]) -> List[Dict]:
+        """Filter out features assigned to ACS PM team"""
+        filtered_issues = []
+        
+        for issue in issues:
+            fields = issue.get('fields', {})
+            team_field = fields.get('customfield_12313240')
+            
+            # Extract team name
+            team_name = None
+            if isinstance(team_field, dict):
+                team_name = team_field.get('name', '')
+            elif isinstance(team_field, str):
+                team_name = team_field
+            elif isinstance(team_field, list) and team_field:
+                # Handle list of teams - check if any team is ACS PM
+                for team in team_field:
+                    if isinstance(team, dict):
+                        team_name = team.get('name', '')
+                    else:
+                        team_name = str(team)
+                    if team_name == 'ACS PM':
+                        break
+            
+            # Skip if assigned to ACS PM team
+            if team_name == 'ACS PM':
+                issue_key = issue.get('key', 'Unknown')
+                print(f"   🚫 Skipping {issue_key} (assigned to ACS PM team)")
+                continue
+                
+            filtered_issues.append(issue)
+        
+        return filtered_issues
 
     def parse_template_sections(self, description: str) -> Dict[str, TemplateSection]:
         """Parse feature description into template sections"""
