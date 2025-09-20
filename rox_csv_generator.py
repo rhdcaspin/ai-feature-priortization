@@ -10,6 +10,8 @@ features with missing template sections when explicitly requested.
 Features:
 - Template validation with regex patterns for Jira wiki markup
 - AI analysis using local Ollama service with caching
+- Effort estimation in 2-week sprints using AI analysis
+- Team field validation and assignment tracking
 - Jira comment functionality for template compliance
 - Comprehensive CSV reporting with compliance scoring
 
@@ -67,6 +69,7 @@ class GenAIValidationResult:
     completeness_score: int # 1-5 scale (5 = most complete)
     implementability_score: int # 1-5 scale (5 = most implementable)
     overall_score: int      # 1-5 scale (5 = highest overall)
+    effort_estimate: int    # Number of 2-week sprints estimated
 
 
 class ROXFeatureReporter:
@@ -508,7 +511,8 @@ class ROXFeatureReporter:
                 clarity_score=data['clarity_score'],
                 completeness_score=data['completeness_score'],
                 implementability_score=data['implementability_score'],
-                overall_score=data['overall_score']
+                overall_score=data['overall_score'],
+                effort_estimate=data.get('effort_estimate', 5)  # Default to 5 sprints for old cached results
             )
         except Exception:
             return None
@@ -596,9 +600,9 @@ class ROXFeatureReporter:
         
         print(f"     🤖 Running Ollama analysis for {key}...")
         
-        # Prepare prompt for Ollama
+        # Prepare prompt for Ollama - now includes effort estimation
         prompt = f"""
-You are a software engineering expert reviewing a feature specification. Please analyze the following feature and provide scores from 1-5 (5 being the highest/best) for each category. Respond ONLY with the 5 scores separated by commas, no other text.
+You are a software engineering expert and Product Manager reviewing a feature specification. Please analyze the following feature and provide scores from 1-5 (5 being the highest/best) for each category, plus an effort estimate. Respond ONLY with the 6 values separated by commas, no other text.
 
 Feature: {summary}
 
@@ -611,9 +615,10 @@ Score the feature on:
 3. Completeness (1-5): How complete is the information provided?
 4. Implementability (1-5): How feasible is this to implement?
 5. Overall Quality (1-5): Overall assessment of the feature specification
+6. Effort Estimate: As a Product Manager, estimate the total effort required to implement this feature in terms of number of 2-week sprints (provide a whole number between 1-20)
 
-Response format: engineering_score,clarity_score,completeness_score,implementability_score,overall_score
-Example: 4,3,5,4,4
+Response format: engineering_score,clarity_score,completeness_score,implementability_score,overall_score,effort_estimate
+Example: 4,3,5,4,4,6
 """
 
         try:
@@ -632,16 +637,17 @@ Example: 4,3,5,4,4
                 result = response.json()
                 response_text = result.get('response', '').strip()
                 
-                # Parse the comma-separated scores
+                # Parse the comma-separated scores and effort estimate
                 try:
                     scores = [int(x.strip()) for x in response_text.split(',')]
-                    if len(scores) >= 5:
+                    if len(scores) >= 6:
                         genai_result = GenAIValidationResult(
                             engineering_score=max(1, min(5, scores[0])),
                             clarity_score=max(1, min(5, scores[1])),
                             completeness_score=max(1, min(5, scores[2])),
                             implementability_score=max(1, min(5, scores[3])),
-                            overall_score=max(1, min(5, scores[4]))
+                            overall_score=max(1, min(5, scores[4])),
+                            effort_estimate=max(1, min(20, scores[5]))
                         )
                         
                         # Cache the result
@@ -665,7 +671,8 @@ Example: 4,3,5,4,4
             clarity_score=3,
             completeness_score=3,
             implementability_score=3,
-            overall_score=3
+            overall_score=3,
+            effort_estimate=5  # Default to 5 sprints (10 weeks)
         )
         
         # Cache the default result too
@@ -730,7 +737,7 @@ Example: 4,3,5,4,4
             'Template_Score', 'Required_Sections_Valid', 'Missing_Required',
             'Has_410_Label', 'Related_Epics_Count', 'PM_Assigned', 'Assignee_Assigned', 'Team_Assigned',
             'GenAI_Overall', 'GenAI_Engineering', 'GenAI_Clarity', 'GenAI_Completeness', 'GenAI_Implementability',
-            'Jira_Rank_Score', 'Compliance_Score'
+            'Effort_Estimate', 'Jira_Rank_Score', 'Compliance_Score'
         ]
         
         print(f"📝 Writing CSV report to {output_file}...")
@@ -819,6 +826,7 @@ Example: 4,3,5,4,4
                     'GenAI_Clarity': genai_result.clarity_score,
                     'GenAI_Completeness': genai_result.completeness_score,
                     'GenAI_Implementability': genai_result.implementability_score,
+                    'Effort_Estimate': genai_result.effort_estimate,
                     'Jira_Rank_Score': jira_rank_score,
                     'Compliance_Score': data['compliance_score']
                 }
