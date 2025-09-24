@@ -321,24 +321,38 @@ class ROXFeatureReporter:
         
         return validation_results
 
-    def get_jira_rank_score(self, feature: Dict) -> float:
-        """Extract numeric rank score from Jira rank field"""
+    def get_jira_rank_value(self, feature: Dict) -> str:
+        """Get the full Jira rank string for proper lexicographic sorting"""
         fields = feature.get('fields', {})
         rank_field = fields.get('customfield_12311940')
+        key = feature.get('key', 'Unknown')
         
         if not rank_field:
-            return 0.0
+            return 'zzz'  # Unranked items go to the end (lexicographically last)
         
+        # For Jira lexicographic ranking, use the full rank string including identifier
+        if isinstance(rank_field, str) and '|' in rank_field:
+            # Use the full string for proper lexicographic ordering
+            return rank_field
+        
+        # If no pipe, use the whole string
+        if isinstance(rank_field, str):
+            return rank_field
+            
+        # Fallback for non-string types
+        return str(rank_field) if rank_field else 'zzz'
+
+    def get_jira_rank_score(self, feature: Dict) -> float:
+        """Extract numeric representation for display (kept for backward compatibility)"""
+        rank_str = self.get_jira_rank_value(feature)
+        if rank_str == 'zzz':
+            return float('inf')
+        
+        # Try to extract numeric part for display
         try:
-            # Jira rank field format: "rank|identifier:"
-            # Extract the numeric rank before the pipe
-            if isinstance(rank_field, str) and '|' in rank_field:
-                rank_str = rank_field.split('|')[0]
-                return float(rank_str)
-            
-            # If it's already a number
-            return float(rank_field)
-            
+            if rank_str and rank_str[0].isdigit():
+                return float(rank_str.split('|')[0] if '|' in rank_str else rank_str)
+            return 0.0
         except (ValueError, TypeError):
             return 0.0
 
@@ -767,18 +781,15 @@ Example: 4,3,5,4,4,6
                 'compliance_score': compliance_score
             })
         
-        # Sort by Jira rank score (higher rank on top)
-        feature_data.sort(key=lambda x: self.get_jira_rank_score(x['feature']), reverse=True)
+        # Sort by Jira rank value (ASC: lexicographic order, matches Jira "order by Rank ASC")
+        feature_data.sort(key=lambda x: self.get_jira_rank_value(x['feature']))
         
-        # Debug: Print first and last few rank scores to verify sorting
+        # Debug: Verify sorting is working (can be disabled in production)
         if len(feature_data) > 0:
             print(f"🔍 Rank sorting verification:")
-            for i in [0, 1, 2, -3, -2, -1]:
-                if abs(i) < len(feature_data):
-                    idx = i if i >= 0 else len(feature_data) + i
-                    rank_score = self.get_jira_rank_score(feature_data[idx]['feature'])
-                    key = feature_data[idx]['feature'].get('key', 'Unknown')
-                    print(f"   Position {idx+1}: {key} (rank: {rank_score})")
+            print(f"   First feature: {feature_data[0]['feature'].get('key', 'Unknown')}")
+            print(f"   Last feature: {feature_data[-1]['feature'].get('key', 'Unknown')}")
+            print(f"   Features are ordered by Jira rank (matches 'order by Rank ASC')")
             print()
         
         # Generate output filename
