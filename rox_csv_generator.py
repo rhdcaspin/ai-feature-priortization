@@ -364,19 +364,19 @@ class ROXFeatureReporter:
         # Check if '4.10.0' is in the labels list
         return '4.10.0' in labels
     
-    def count_related_epics(self, feature: Dict) -> str:
+    def count_related_items(self, feature: Dict) -> int:
         """
-        Count the number of epics and subtasks related to this feature
+        Count the total number of related items (epics + stories + subtasks) for this feature
         
         Since direct parent-child epic relationships are not standard in Jira,
-        we'll count epics through multiple methods and provide a manual override
-        for known cases. Also counts all subtasks for comprehensive tracking.
+        we'll count items through multiple methods and provide a manual override
+        for known cases. Returns a single total count.
         
         Args:
             feature: Jira feature data
             
         Returns:
-            String in format "E:X/S:Y" where X=epics, Y=subtasks
+            Total number of related items (epics + stories + subtasks)
         """
         fields = feature.get('fields', {})
         epic_count = 0
@@ -384,30 +384,37 @@ class ROXFeatureReporter:
         
         # Manual overrides for known cases where Jira API doesn't show the relationships
         # that are visible in the UI (often due to custom fields or complex relationships)
-        manual_epic_counts = {
-            'ROX-28072': 5,  # User reported 5 child epics visible in Jira UI
+        manual_item_counts = {
+            'ROX-28072': 5,   # User reported 5 child epics visible in Jira UI
+            'ROX-26332': 0,   # User reported epic count issue - update with correct count
             # Add other known cases here as needed:
-            # 'ROX-XXXXX': N,  # Replace with actual feature key and epic count
+            # 'ROX-XXXXX': N,  # Replace with actual feature key and total item count
         }
         
         # 1. Check subtasks (child issues) for epics and count all subtasks
         subtasks = fields.get('subtasks', [])
         subtask_count = len(subtasks)
         
-        if key in manual_epic_counts:
-            manual_epic_count = manual_epic_counts[key]
-            return f"E:{manual_epic_count}/S:{subtask_count}"
+        if key in manual_item_counts:
+            return manual_item_counts[key]
         
+        total_count = 0
+        
+        # Count all subtasks (regardless of type)
+        total_count += len(subtasks)
+        
+        # Count items from subtasks (epics, stories, etc.)
         for subtask in subtasks:
             if isinstance(subtask, dict):
                 subtask_fields = subtask.get('fields', {})
                 issue_type = subtask_fields.get('issuetype', {})
                 type_name = issue_type.get('name', '').lower()
                 
+                # Count epics separately for debugging
                 if type_name == 'epic':
                     epic_count += 1
         
-        # 2. Check issue links for epics
+        # Count linked items (epics, stories, etc.)
         issue_links = fields.get('issuelinks', [])
         for link in issue_links:
             # Check both inward and outward links
@@ -423,9 +430,11 @@ class ROXFeatureReporter:
                 issue_type = linked_fields.get('issuetype', {})
                 type_name = issue_type.get('name', '').lower()
                 
-                # Count if the linked issue is an epic
-                if type_name == 'epic':
-                    epic_count += 1
+                # Count all linked items (epics, stories, etc.)
+                if type_name in ['epic', 'story', 'task', 'bug']:
+                    total_count += 1
+                    if type_name == 'epic':
+                        epic_count += 1
         
         # 3. For debugging specific features
         if key == 'ROX-28072':
@@ -433,7 +442,30 @@ class ROXFeatureReporter:
             print(f"       Found {len(subtasks)} subtasks, {len(issue_links)} issue links via API")
             print(f"       Note: Child epics may use custom fields not accessible via standard API")
         
-        return f"E:{epic_count}/S:{subtask_count}"
+        # Debug ROX-26332 epic counting issue
+        if key == 'ROX-26332':
+            print(f"   🔍 Debug ROX-26332: Item counting analysis")
+            print(f"       Found {len(subtasks)} subtasks:")
+            for i, subtask in enumerate(subtasks[:5]):  # Show first 5
+                if isinstance(subtask, dict):
+                    st_fields = subtask.get('fields', {})
+                    st_type = st_fields.get('issuetype', {})
+                    st_key = subtask.get('key', 'Unknown')
+                    print(f"         {i+1}. {st_key}: {st_type.get('name', 'Unknown type')}")
+            
+            print(f"       Found {len(issue_links)} issue links:")
+            for i, link in enumerate(issue_links[:5]):  # Show first 5
+                linked_issue = link.get('inwardIssue') or link.get('outwardIssue')
+                if linked_issue:
+                    li_fields = linked_issue.get('fields', {})
+                    li_type = li_fields.get('issuetype', {})
+                    li_key = linked_issue.get('key', 'Unknown')
+                    link_type = link.get('type', {}).get('name', 'Unknown')
+                    print(f"         {i+1}. {li_key}: {li_type.get('name', 'Unknown type')} ({link_type})")
+            
+            print(f"       Current total_count: {total_count} (epics: {epic_count}, subtasks: {len(subtasks)})")
+        
+        return total_count
     
 
     def calculate_compliance_score(self, feature: Dict, validation: Dict, genai_result: GenAIValidationResult) -> int:
@@ -763,7 +795,7 @@ Example: 4,3,5,4,4,6
             
             # Additional checks
             has_410_label = self.check_410_label(feature)
-            epic_count = self.count_related_epics(feature)
+            related_count = self.count_related_items(feature)
             pm_assigned = self.check_product_manager_assigned(feature)
             assignee_assigned = self.check_assignee_assigned(feature)
             team_assigned = self.check_team_assigned(feature)
@@ -774,7 +806,7 @@ Example: 4,3,5,4,4,6
                 'validation': validation,
                 'genai_result': genai_result,
                 'has_410_label': has_410_label,
-                'epic_count': epic_count,
+                'related_count': related_count,
                 'pm_assigned': pm_assigned,
                 'assignee_assigned': assignee_assigned,
                 'team_assigned': team_assigned,
@@ -802,7 +834,7 @@ Example: 4,3,5,4,4,6
             'Rank', 'Key', 'Summary', 'Status', 'Link',
             'Assignee', 'Product_Manager', 'Team', 'Target_Version',
             'Template_Score', 'Required_Sections_Valid', 'Missing_Required',
-            'Has_410_Label', 'Epics_Subtasks', 'PM_Assigned', 'Assignee_Assigned', 'Team_Assigned',
+            'Has_410_Label', 'Related_Items', 'PM_Assigned', 'Assignee_Assigned', 'Team_Assigned',
             'GenAI_Overall', 'GenAI_Engineering', 'GenAI_Clarity', 'GenAI_Completeness', 'GenAI_Implementability',
             'Effort_Estimate', 'Jira_Rank_Score', 'Compliance_Score'
         ]
@@ -878,7 +910,7 @@ Example: 4,3,5,4,4,6
                     'Required_Sections_Valid': validation.get('required_sections_valid', 0),
                     'Missing_Required': '; '.join(validation.get('missing_required', [])),
                     'Has_410_Label': 'Yes' if data['has_410_label'] else 'No',
-                    'Epics_Subtasks': data['epic_count'],
+                    'Related_Items': data['related_count'],
                     'PM_Assigned': 'Yes' if data['pm_assigned'] else 'No',
                     'Assignee_Assigned': 'Yes' if data['assignee_assigned'] else 'No',
                     'Team_Assigned': 'Yes' if data['team_assigned'] else 'No',
