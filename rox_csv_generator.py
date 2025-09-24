@@ -770,6 +770,17 @@ Example: 4,3,5,4,4,6
         # Sort by Jira rank score (higher rank on top)
         feature_data.sort(key=lambda x: self.get_jira_rank_score(x['feature']), reverse=True)
         
+        # Debug: Print first and last few rank scores to verify sorting
+        if len(feature_data) > 0:
+            print(f"🔍 Rank sorting verification:")
+            for i in [0, 1, 2, -3, -2, -1]:
+                if abs(i) < len(feature_data):
+                    idx = i if i >= 0 else len(feature_data) + i
+                    rank_score = self.get_jira_rank_score(feature_data[idx]['feature'])
+                    key = feature_data[idx]['feature'].get('key', 'Unknown')
+                    print(f"   Position {idx+1}: {key} (rank: {rank_score})")
+            print()
+        
         # Generate output filename
         if not output_file:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -791,9 +802,6 @@ Example: 4,3,5,4,4,6
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
             
-            current_rank = 1
-            last_rank_score = None
-            
             for i, data in enumerate(feature_data):
                 feature = data['feature']
                 validation = data['validation']
@@ -801,11 +809,8 @@ Example: 4,3,5,4,4,6
                 
                 fields = feature.get('fields', {})
                 
-                # Handle rank assignment (same score = same rank)
+                # Get the actual Jira rank score for this feature
                 jira_rank_score = self.get_jira_rank_score(feature)
-                if last_rank_score is not None and jira_rank_score != last_rank_score:
-                    current_rank = i + 1
-                last_rank_score = jira_rank_score
                 
                 # Extract field values safely
                 assignee = fields.get('assignee')
@@ -849,7 +854,7 @@ Example: 4,3,5,4,4,6
                 status_name = status.get('name', 'Unknown') if isinstance(status, dict) else str(status)
                 
                 row = {
-                    'Rank': current_rank,
+                    'Rank': jira_rank_score,
                     'Key': feature.get('key', 'Unknown'),
                     'Summary': fields.get('summary', ''),
                     'Status': status_name,
