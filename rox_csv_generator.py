@@ -350,19 +350,19 @@ class ROXFeatureReporter:
         # Check if '4.10.0' is in the labels list
         return '4.10.0' in labels
     
-    def count_related_epics(self, feature: Dict) -> int:
+    def count_related_epics(self, feature: Dict) -> str:
         """
-        Count the number of epics related to this feature
+        Count the number of epics and subtasks related to this feature
         
         Since direct parent-child epic relationships are not standard in Jira,
         we'll count epics through multiple methods and provide a manual override
-        for known cases.
+        for known cases. Also counts all subtasks for comprehensive tracking.
         
         Args:
             feature: Jira feature data
             
         Returns:
-            Number of related epics
+            String in format "E:X/S:Y" where X=epics, Y=subtasks
         """
         fields = feature.get('fields', {})
         epic_count = 0
@@ -376,11 +376,14 @@ class ROXFeatureReporter:
             # 'ROX-XXXXX': N,  # Replace with actual feature key and epic count
         }
         
-        if key in manual_epic_counts:
-            return manual_epic_counts[key]
-        
-        # 1. Check subtasks (child issues) for epics
+        # 1. Check subtasks (child issues) for epics and count all subtasks
         subtasks = fields.get('subtasks', [])
+        subtask_count = len(subtasks)
+        
+        if key in manual_epic_counts:
+            manual_epic_count = manual_epic_counts[key]
+            return f"E:{manual_epic_count}/S:{subtask_count}"
+        
         for subtask in subtasks:
             if isinstance(subtask, dict):
                 subtask_fields = subtask.get('fields', {})
@@ -416,7 +419,7 @@ class ROXFeatureReporter:
             print(f"       Found {len(subtasks)} subtasks, {len(issue_links)} issue links via API")
             print(f"       Note: Child epics may use custom fields not accessible via standard API")
         
-        return epic_count
+        return f"E:{epic_count}/S:{subtask_count}"
     
 
     def calculate_compliance_score(self, feature: Dict, validation: Dict, genai_result: GenAIValidationResult) -> int:
@@ -764,8 +767,8 @@ Example: 4,3,5,4,4,6
                 'compliance_score': compliance_score
             })
         
-        # Sort by Jira rank score (lower is higher priority)
-        feature_data.sort(key=lambda x: self.get_jira_rank_score(x['feature']))
+        # Sort by Jira rank score (higher rank on top)
+        feature_data.sort(key=lambda x: self.get_jira_rank_score(x['feature']), reverse=True)
         
         # Generate output filename
         if not output_file:
@@ -777,7 +780,7 @@ Example: 4,3,5,4,4,6
             'Rank', 'Key', 'Summary', 'Status', 'Link',
             'Assignee', 'Product_Manager', 'Team', 'Target_Version',
             'Template_Score', 'Required_Sections_Valid', 'Missing_Required',
-            'Has_410_Label', 'Related_Epics_Count', 'PM_Assigned', 'Assignee_Assigned', 'Team_Assigned',
+            'Has_410_Label', 'Epics_Subtasks', 'PM_Assigned', 'Assignee_Assigned', 'Team_Assigned',
             'GenAI_Overall', 'GenAI_Engineering', 'GenAI_Clarity', 'GenAI_Completeness', 'GenAI_Implementability',
             'Effort_Estimate', 'Jira_Rank_Score', 'Compliance_Score'
         ]
@@ -859,7 +862,7 @@ Example: 4,3,5,4,4,6
                     'Required_Sections_Valid': validation.get('required_sections_valid', 0),
                     'Missing_Required': '; '.join(validation.get('missing_required', [])),
                     'Has_410_Label': 'Yes' if data['has_410_label'] else 'No',
-                    'Related_Epics_Count': data['epic_count'],
+                    'Epics_Subtasks': data['epic_count'],
                     'PM_Assigned': 'Yes' if data['pm_assigned'] else 'No',
                     'Assignee_Assigned': 'Yes' if data['assignee_assigned'] else 'No',
                     'Team_Assigned': 'Yes' if data['team_assigned'] else 'No',
