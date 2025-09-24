@@ -386,7 +386,7 @@ class ROXFeatureReporter:
         # that are visible in the UI (often due to custom fields or complex relationships)
         manual_item_counts = {
             'ROX-28072': 5,   # User reported 5 child epics visible in Jira UI
-            'ROX-26332': 0,   # User reported epic count issue - update with correct count
+            'ROX-26332': 20,  # User confirmed 20 epics visible in Jira UI
             # Add other known cases here as needed:
             # 'ROX-XXXXX': N,  # Replace with actual feature key and total item count
         }
