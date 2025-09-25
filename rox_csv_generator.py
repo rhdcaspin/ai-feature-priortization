@@ -251,7 +251,7 @@ class ROXFeatureReporter:
             'Goal Summary': (True, r'(?:h3\.\s*)?\*?Goal Summary:?\*?\s*(.*?)(?=\n\s*(?:h3\.|\*?[A-Z][^:]*:?\*?|$))', re.DOTALL | re.IGNORECASE),
             'Goals and expected user outcomes': (True, r'(?:h3\.\s*)?\*?Goals and expected user outcomes:?\*?\s*(.*?)(?=\n\s*(?:h3\.|\*?[A-Z][^:]*:?\*?|$))', re.DOTALL | re.IGNORECASE),
             'Acceptance Criteria': (True, r'(?:h3\.\s*)?\*?Acceptance Criteria:?\*?\s*(.*?)(?=\n\s*(?:h3\.|\*?[A-Z][^:]*:?\*?|$))', re.DOTALL | re.IGNORECASE),
-            'Success Criteria or KPIs measured': (True, r'(?:h3\.\s*)?\*?Success Criteria or KPIs measured:?\*?\s*(.*?)(?=\n\s*(?:h3\.|\*?[A-Z][^:]*:?\*?|$))', re.DOTALL | re.IGNORECASE),
+            'Success Criteria or KPIs measured': (False, r'(?:h3\.\s*)?\*?Success Criteria or KPIs measured:?\*?\s*(.*?)(?=\n\s*(?:h3\.|\*?[A-Z][^:]*:?\*?|$))', re.DOTALL | re.IGNORECASE),
             'Use Cases': (False, r'(?:h3\.\s*)?\*?Use Cases.*?:?\*?\s*(.*?)(?=\n\s*(?:h3\.|\*?[A-Z][^:]*:?\*?|$))', re.DOTALL | re.IGNORECASE),
             'Out of Scope': (False, r'(?:h3\.\s*)?\*?Out of Scope.*?:?\*?\s*(.*?)(?=\n\s*(?:h3\.|\*?[A-Z][^:]*:?\*?|$))', re.DOTALL | re.IGNORECASE)
         }
@@ -281,8 +281,8 @@ class ROXFeatureReporter:
         }
         
         required_sections = ['Goal Summary', 'Goals and expected user outcomes', 
-                           'Acceptance Criteria', 'Success Criteria or KPIs measured']
-        optional_sections = ['Use Cases', 'Out of Scope']
+                           'Acceptance Criteria']
+        optional_sections = ['Use Cases', 'Out of Scope', 'Success Criteria or KPIs measured']
         
         for section_name in required_sections:
             section = sections.get(section_name, TemplateSection(section_name, True))
@@ -1073,8 +1073,8 @@ This comment was automatically generated based on template validation analysis.
                     
                     print(f"Processing {key}: {summary[:50]}...")
                     
-                    # Check if feature needs comments (Required_Sections_Valid < 4)
-                    if required_valid < 4:
+                    # Check if feature needs comments (Required_Sections_Valid < 3)
+                    if required_valid < 3:
                         stats['features_needing_comments'] += 1
                         
                         # Parse missing sections
@@ -1082,7 +1082,7 @@ This comment was automatically generated based on template validation analysis.
                         if missing_required:
                             missing_sections = [section.strip() for section in missing_required.split(';')]
                         
-                        print(f"   🔍 Missing {4 - required_valid} required sections")
+                        print(f"   🔍 Missing {3 - required_valid} required sections")
                         print(f"   👤 Product Manager: {pm_name}")
                         
                         if dry_run:
