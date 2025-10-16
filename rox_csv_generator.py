@@ -260,6 +260,7 @@ class ROXFeatureReporter:
             match = re.search(pattern, description, flags)
             content = match.group(1).strip() if match else ""
             sections[section_name] = TemplateSection(section_name, required, content)
+            
         
         return sections
 
