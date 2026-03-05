@@ -1,6 +1,9 @@
 # Environment variables
 .env
 
+# ROX export state (last run timestamp)
+.rox_export_last_run
+
 # Cache directory
 llm_cache/
 
@@ -15,6 +18,7 @@ __pycache__/
 
 # CSV reports
 rox_4_10_features_*.csv
+rox_features_export_*.csv
 
 # Jupyter notebook checkpoints
 .ipynb_checkpoints/
