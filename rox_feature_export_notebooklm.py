@@ -16,6 +16,7 @@ Usage:
 
 Options:
     --skip-upload     Generate CSV only, skip NotebookLM upload
+    --drive-folder-id Upload results to Google Drive folder (replaces file each run)
     --notebook-name   Name of NotebookLM notebook (default: ROX Features Export)
     --force-all      Ignore last-run state; export open features only
     --all-features    Export ALL features (all statuses, no date filter)
@@ -32,6 +33,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any
 
 import requests
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).parent / ".env")
 
 # Optional NotebookLM support
 try:

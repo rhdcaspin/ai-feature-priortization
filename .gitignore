@@ -1,46 +1,31 @@
 # Environment variables
 .env
 
-# ROX export state (last run timestamp)
+# ROX export state
 .rox_export_last_run
 
-# Cache directory
-llm_cache/
-
-# Google API credentials and tokens
-credentials.json
-token.json
-
-# Python cache
+# Python
 __pycache__/
 *.pyc
 *.pyo
+.venv/
 
-# CSV reports
-rox_4_10_features_*.csv
+# Generated CSV exports
 rox_features_export_*.csv
+output/
 
-# Jupyter notebook checkpoints
-.ipynb_checkpoints/
+# Google API credentials
+credentials.json
+token.json
 
-# Temporary files and test scripts
-debug_*.py
-test_*.py
-*_demo.py
-*_example.py
-quick_*.py
-
-# Database files (unless specifically needed)
-*.db
-*.sqlite
-
-# IDE files
+# IDE / OS
 .vscode/
 .idea/
 *.swp
 *.swo
-
-# OS files
 .DS_Store
 Thumbs.db
-node_modules
+
+# Temporary / test scripts
+debug_*.py
+test_*.py

@@ -1,1 +1,5 @@
 requests>=2.28.0
+python-dotenv>=1.0.0
+
+# Optional: for rox_feature_export_notebooklm.py NotebookLM upload
+# pip install notebooklm-mcp-cli && nlm login
