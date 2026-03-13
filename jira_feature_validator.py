@@ -3,7 +3,11 @@
 Jira Feature Template Validator
 
 This script connects to a Jira organization using API token authentication,
-filters for 4.10 features, and validates them against a required template structure.
+filters features by target version, and validates them against a required template structure.
+
+Usage:
+    python3 jira_feature_validator.py --target-version 4.11.0
+    python3 jira_feature_validator.py --target-version 4.12.0
 """
 
 import os
@@ -15,6 +19,11 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 import argparse
 from dataclasses import dataclass
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).parent / ".env")
 
 
 @dataclass
@@ -39,20 +48,13 @@ class JiraFeatureValidator:
         TemplateSection("out_of_scope", "Out of Scope (Optional):", False, "<your text here>")
     ]
     
-    def __init__(self, jira_url: str, email: str, api_token: str, project_key: str = None):
-        """
-        Initialize the Jira validator
-        
-        Args:
-            jira_url: Base URL of your Jira instance (e.g., https://issues.redhat.com)
-            email: Your Jira email address (for Red Hat Jira, can be optional)
-            api_token: Your Jira API token
-            project_key: Optional project key to filter by
-        """
+    def __init__(self, jira_url: str, email: str, api_token: str,
+                 project_key: str = "ROX", target_version: str = "4.11.0"):
         self.jira_url = jira_url.rstrip('/')
         self.api_token = api_token
         self.email = email
         self.project_key = project_key
+        self.target_version = target_version
         self.session = requests.Session()
         
         # Set up authentication for Red Hat Jira (Bearer token)
@@ -97,19 +99,13 @@ class JiraFeatureValidator:
             print(f"❌ Failed to connect to Jira: {e}")
             return False
     
-    def get_4_10_features(self) -> List[Dict]:
-        """
-        Retrieve all 4.10 features from Jira
+    def get_features(self) -> List[Dict]:
+        """Retrieve features for the configured target version from Jira."""
+        print(f"🔍 Searching for {self.target_version} features...")
         
-        Returns:
-            List of feature issues
-        """
-        print("🔍 Searching for 4.10 features...")
-        
-        # JQL query to find 4.10 features in ROX project
         jql_parts = [
-            'project = rox',
-            '"Target Version" = 4.10.0',
+            f'project = {self.project_key}',
+            f'"Target Version" = {self.target_version}',
             'type = feature'
         ]
         
@@ -151,7 +147,7 @@ class JiraFeatureValidator:
                 print(f"❌ Error fetching features: {e}")
                 break
         
-        print(f"📊 Found {len(features)} 4.10 features")
+        print(f"📊 Found {len(features)} {self.target_version} features")
         return features
     
     def extract_template_sections(self, description: str) -> Dict[str, str]:
@@ -261,200 +257,134 @@ class JiraFeatureValidator:
             'overall_valid': required_missing == 0
         }
     
-    def generate_csv_report(self, features: List[Dict]) -> str:
-        """
-        Generate a CSV report with specified fields
-        
-        Args:
-            features: List of feature issues from Jira
-            
-        Returns:
-            CSV filename
-        """
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        csv_filename = f"rox_4_10_features_report_{timestamp}.csv"
-        
-        print(f"📄 Generating CSV report: {csv_filename}")
-        
-        with open(csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
-            fieldnames = ['Key', 'Summary', 'Assignee', 'Product Manager', 'Target Version']
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            
-            # Write header
-            writer.writeheader()
-            
-            # Write data rows
-            for feature in features:
-                fields = feature.get('fields', {})
-                assignee = fields.get('assignee')
-                assignee_name = assignee.get('displayName', 'Unassigned') if assignee else 'Unassigned'
-                
-                # Extract custom fields
-                product_manager = fields.get('customfield_12316752')
-                product_manager_name = ''
-                if product_manager:
-                    if isinstance(product_manager, dict):
-                        product_manager_name = product_manager.get('displayName', '')
-                    elif isinstance(product_manager, str):
-                        product_manager_name = product_manager
-                
-                target_version = fields.get('customfield_12319940')
-                target_version_name = ''
-                if target_version:
-                    if isinstance(target_version, list) and len(target_version) > 0:
-                        # If it's a list, take the first item
-                        first_version = target_version[0]
-                        if isinstance(first_version, dict):
-                            target_version_name = first_version.get('name', str(first_version))
-                        else:
-                            target_version_name = str(first_version)
-                    elif isinstance(target_version, dict):
-                        target_version_name = target_version.get('name', str(target_version))
-                    else:
-                        target_version_name = str(target_version)
-                
-                row = {
-                    'Key': feature.get('key', ''),
-                    'Summary': fields.get('summary', ''),
-                    'Assignee': assignee_name,
-                    'Product Manager': product_manager_name,
-                    'Target Version': target_version_name
-                }
-                writer.writerow(row)
-        
-        print(f"✅ CSV report saved with {len(features)} features")
-        return csv_filename
+    def _extract_display_name(self, field_value) -> str:
+        if not field_value:
+            return ""
+        if isinstance(field_value, dict):
+            return field_value.get("displayName", "")
+        return str(field_value)
 
-    def generate_report(self, validation_results: List[Dict]) -> str:
-        """
-        Generate a comprehensive validation report
-        
-        Args:
-            validation_results: List of feature validation results
-            
-        Returns:
-            Formatted report string
-        """
-        report = []
-        report.append("=" * 80)
-        report.append("🎯 JIRA 4.10 FEATURE TEMPLATE VALIDATION REPORT")
-        report.append("=" * 80)
-        report.append(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        report.append("")
-        
-        # Summary statistics
-        total_features = len(validation_results)
-        fully_compliant = sum(1 for r in validation_results if r['overall_valid'])
-        partially_compliant = sum(1 for r in validation_results if not r['overall_valid'] and r['required_missing'] == 0)
-        non_compliant = total_features - fully_compliant
-        
-        report.append("📊 SUMMARY STATISTICS")
-        report.append("-" * 40)
-        report.append(f"Total Features Analyzed: {total_features}")
-        report.append(f"✅ Fully Compliant: {fully_compliant} ({fully_compliant/total_features*100:.1f}%)")
-        report.append(f"❌ Non-Compliant: {non_compliant} ({non_compliant/total_features*100:.1f}%)")
-        report.append("")
-        
-        # Detailed results
-        report.append("📋 DETAILED VALIDATION RESULTS")
-        report.append("-" * 40)
-        
-        for result in validation_results:
-            report.append(f"\n🎫 {result['key']}: {result['summary']}")
-            report.append(f"   Overall Status: {'✅ COMPLIANT' if result['overall_valid'] else '❌ NON-COMPLIANT'}")
-            report.append(f"   Required sections missing: {result['required_missing']}")
-            report.append(f"   Optional sections missing: {result['optional_missing']}")
-            
-            for validation in result['validation_results']:
-                report.append(f"   {validation['message']}")
-                if not validation['valid'] and validation['content_preview']:
-                    report.append(f"      Preview: {validation['content_preview']}")
-        
-        # Recommendations
-        report.append("\n" + "=" * 80)
-        report.append("💡 RECOMMENDATIONS")
-        report.append("=" * 80)
-        
-        if non_compliant > 0:
-            report.append("1. Review non-compliant features and ensure all required sections are completed")
-            report.append("2. Replace placeholder text with actual feature information")
-            report.append("3. Ensure each section has sufficient detail (minimum 10 characters)")
-            report.append("4. Consider adding optional sections for better feature documentation")
-        else:
-            report.append("🎉 All features are compliant with the template requirements!")
-        
-        return "\n".join(report)
+    def _extract_version_name(self, field_value) -> str:
+        if not field_value:
+            return ""
+        if isinstance(field_value, list) and field_value:
+            item = field_value[0]
+            return item.get("name", str(item)) if isinstance(item, dict) else str(item)
+        if isinstance(field_value, dict):
+            return field_value.get("name", str(field_value))
+        return str(field_value)
+
+    def generate_compliance_csv(self, features: List[Dict],
+                                validation_results: List[Dict]) -> str:
+        """Generate a single CSV combining feature info and per-section compliance."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        version_tag = self.target_version.replace(".", "_")
+        output_dir = Path(__file__).parent / "output"
+        output_dir.mkdir(exist_ok=True)
+        csv_path = output_dir / f"rox_{version_tag}_compliance_{timestamp}.csv"
+
+        section_headers = [s.header for s in self.TEMPLATE_SECTIONS]
+        fieldnames = [
+            "Key", "Summary", "Status", "Assignee", "Product Manager",
+            "Target Version", "Compliant", "Required Missing",
+        ] + section_headers
+
+        feature_map = {f.get("key"): f for f in features}
+
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+
+            for result in validation_results:
+                feature = feature_map.get(result["key"], {})
+                fields = feature.get("fields", {})
+
+                row = {
+                    "Key": result["key"],
+                    "Summary": result["summary"],
+                    "Status": (fields.get("status") or {}).get("name", ""),
+                    "Assignee": (fields.get("assignee") or {}).get("displayName", "Unassigned"),
+                    "Product Manager": self._extract_display_name(fields.get("customfield_12316752")),
+                    "Target Version": self._extract_version_name(fields.get("customfield_12319940")),
+                    "Compliant": "Yes" if result["overall_valid"] else "No",
+                    "Required Missing": result["required_missing"],
+                }
+
+                for v in result["validation_results"]:
+                    if v["valid"]:
+                        row[v["header"]] = "PASS"
+                    elif not v["required"]:
+                        row[v["header"]] = "SKIP (optional)"
+                    elif not v["content_preview"]:
+                        row[v["header"]] = "MISSING"
+                    else:
+                        row[v["header"]] = f"FAIL: {v['content_preview']}"
+
+                writer.writerow(row)
+
+        print(f"✅ Compliance CSV saved: {csv_path}")
+        return str(csv_path)
     
     def run_validation(self) -> None:
         """Run the complete validation process"""
-        print("🚀 Starting ROX 4.10 Feature Analysis and Template Validation")
+        print(f"🚀 Starting ROX {self.target_version} Feature Analysis and Template Validation")
         print("=" * 60)
-        
-        # Test connection
+
         if not self.test_connection():
             return
-        
-        # Get features
-        features = self.get_4_10_features()
+
+        features = self.get_features()
         if not features:
-            print("⚠️  No 4.10 features found")
+            print(f"⚠️  No {self.target_version} features found")
             return
-        
-        # Generate CSV report with requested fields
-        csv_filename = self.generate_csv_report(features)
-        
-        # Validate features against template
+
         print("🔍 Validating features against template...")
         validation_results = []
-        
         for i, feature in enumerate(features, 1):
             print(f"   Processing {i}/{len(features)}: {feature.get('key', 'Unknown')}")
-            result = self.validate_feature(feature)
-            validation_results.append(result)
-        
-        # Generate and save validation report
-        report = self.generate_report(validation_results)
-        
-        # Save validation report to file
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        report_filename = f"jira_feature_validation_report_{timestamp}.txt"
-        
-        with open(report_filename, 'w', encoding='utf-8') as f:
-            f.write(report)
-        
-        print(f"\n📄 Validation report saved to: {report_filename}")
-        print(f"📄 CSV report saved to: {csv_filename}")
-        print("\n" + "=" * 60)
-        print("📊 QUICK SUMMARY")
-        print("=" * 60)
-        
-        # Print quick summary
+            validation_results.append(self.validate_feature(feature))
+
+        csv_path = self.generate_compliance_csv(features, validation_results)
+
         total = len(validation_results)
-        compliant = sum(1 for r in validation_results if r['overall_valid'])
+        compliant = sum(1 for r in validation_results if r["overall_valid"])
+        print(f"\n{'=' * 60}")
+        print("📊 QUICK SUMMARY")
+        print(f"{'=' * 60}")
         print(f"Features analyzed: {total}")
-        print(f"Compliant: {compliant} ({compliant/total*100:.1f}%)")
-        print(f"Non-compliant: {total-compliant} ({(total-compliant)/total*100:.1f}%)")
+        print(f"Compliant: {compliant} ({compliant / total * 100:.1f}%)")
+        print(f"Non-compliant: {total - compliant} ({(total - compliant) / total * 100:.1f}%)")
+        print(f"\n📄 Report: {csv_path}")
 
 
 def main():
-    """Main function with command line argument parsing"""
-    parser = argparse.ArgumentParser(description='Generate CSV report for ROX 4.10 features with template validation')
-    parser.add_argument('--jira-url', default='https://issues.redhat.com', help='Jira base URL (default: https://issues.redhat.com)')
-    parser.add_argument('--email', help='Your Jira email address (optional for Red Hat Jira)')
-    parser.add_argument('--token', default=os.getenv('JIRA_TOKEN', ''), help='Your Jira API token')
-    
+    parser = argparse.ArgumentParser(
+        description='Validate ROX features against the required template structure'
+    )
+    parser.add_argument('--target-version', default='4.11.0',
+                        help='Target version to validate (default: 4.11.0)')
+    parser.add_argument('--jira-url', default=os.getenv('JIRA_BASE_URL', 'https://issues.redhat.com'),
+                        help='Jira base URL')
+    parser.add_argument('--email', default=os.getenv('JIRA_EMAIL', ''),
+                        help='Jira email (optional for Red Hat Jira)')
+    parser.add_argument('--token', default=os.getenv('JIRA_TOKEN', ''),
+                        help='Jira API token (default: JIRA_TOKEN from .env)')
+
     args = parser.parse_args()
-    
+
+    if not args.token:
+        print("❌ JIRA_TOKEN not set. Provide --token or set it in .env")
+        return 1
+
     try:
         validator = JiraFeatureValidator(
             jira_url=args.jira_url,
-            email=args.email or "",  # Email can be empty for Red Hat Jira
+            email=args.email,
             api_token=args.token,
-            project_key="ROX"  # Hardcoded to ROX project
+            project_key="ROX",
+            target_version=args.target_version,
         )
-        
         validator.run_validation()
-        
     except KeyboardInterrupt:
         print("\n⚠️  Validation interrupted by user")
     except Exception as e:
@@ -464,30 +394,5 @@ def main():
 
 
 if __name__ == "__main__":
-    # You can also run directly with environment variables
-    if len(os.sys.argv) == 1:  # No command line arguments
-        # Try to get from environment variables
-        jira_url = os.getenv('JIRA_URL', 'https://issues.redhat.com')
-        email = os.getenv('JIRA_EMAIL', '')
-        token = os.getenv('JIRA_TOKEN', '')
-        project = os.getenv('JIRA_PROJECT')
-        
-        if jira_url and token:
-            print("🔧 Using configuration for Red Hat Jira ROX project")
-            validator = JiraFeatureValidator(jira_url, email, token, "ROX")
-            validator.run_validation()
-        else:
-            print("💡 Usage examples:")
-            print("\n1. Quick start (Red Hat Jira with provided token):")
-            print("   python jira_feature_validator.py")
-            print("\n2. Command line arguments:")
-            print("   python jira_feature_validator.py --project RHEL")
-            print("\n3. Environment variables:")
-            print("   export JIRA_URL=https://issues.redhat.com")
-            print("   export JIRA_EMAIL=your@redhat.com")
-            print("   export JIRA_TOKEN=your_api_token")
-            print("   export JIRA_PROJECT=RHEL  # optional")
-            print("   python jira_feature_validator.py")
-    else:
-        main()
+    main()
 

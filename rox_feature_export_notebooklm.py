@@ -49,6 +49,63 @@ except ImportError:
 DEFAULT_STATE_FILE = Path(__file__).parent / ".rox_export_last_run"
 DEFAULT_JIRA_URL = "https://issues.redhat.com"
 
+# Red Hat SSO / Hydra API for case account lookup
+RH_SSO_TOKEN_URL = "https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token"
+RH_HYDRA_CASE_URL = "https://access.redhat.com/hydra/rest/cases"
+
+
+def get_rh_access_token(offline_token: str) -> Optional[str]:
+    """Exchange a Red Hat offline token for a short-lived access token."""
+    try:
+        resp = requests.post(
+            RH_SSO_TOKEN_URL,
+            data={
+                "grant_type": "refresh_token",
+                "client_id": "rhsm-api",
+                "refresh_token": offline_token,
+            },
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            return resp.json().get("access_token")
+        print(f"⚠️  Red Hat SSO token exchange failed: {resp.status_code}")
+    except Exception as e:
+        print(f"⚠️  Red Hat SSO error: {e}")
+    return None
+
+
+def fetch_case_account_name(
+    case_number: str,
+    access_token: str,
+    cache: Dict[str, str],
+) -> str:
+    """Look up the account/customer name for a support case via the Hydra API."""
+    if case_number in cache:
+        return cache[case_number]
+    try:
+        resp = requests.get(
+            f"{RH_HYDRA_CASE_URL}/{case_number}",
+            headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            account = (
+                data.get("accountName")
+                or data.get("account", {}).get("name", "")
+                or data.get("contactName", "")
+            )
+            cache[case_number] = account
+            return account
+        elif resp.status_code == 404:
+            cache[case_number] = ""
+        else:
+            print(f"⚠️  Hydra API {resp.status_code} for case {case_number}")
+    except Exception:
+        pass
+    cache[case_number] = ""
+    return ""
+
 
 # Curated list of fields - avoids 400 errors from requesting too many fields at once.
 # Red Hat Jira has many custom fields; requesting all can exceed API limits.
@@ -207,6 +264,98 @@ def fetch_issue_links(
     return []
 
 
+def fetch_rfe_sfdc_data(
+    rfe_key: str,
+    jira_url: str,
+    session: requests.Session,
+    api_version: str,
+    cache: Dict[str, List[Dict[str, str]]],
+) -> List[Dict[str, str]]:
+    """Fetch SFDC case IDs and account names from an RFE issue.
+
+    Checks remote links for Salesforce URLs and extracts case IDs.
+    Then fetches the RFE issue fields to look for SFDC account data
+    in custom fields (e.g. SFDC Cases Links, summary patterns).
+
+    Returns list of dicts: [{"case_id": "...", "account_name": "..."}, ...]
+    """
+    if rfe_key in cache:
+        return cache[rfe_key]
+
+    results = []
+    seen_case_ids: set = set()
+
+    # --- 1. Remote links: look for Salesforce case URLs ---
+    try:
+        resp = session.get(
+            f"{jira_url}/rest/api/{api_version}/issue/{rfe_key}/remotelink",
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            for link in resp.json():
+                obj = link.get("object", {}) or {}
+                url = obj.get("url", "") or ""
+                title = obj.get("title", "") or ""
+                summary = obj.get("summary", "") or ""
+
+                combined = f"{url} {title} {summary}"
+                if not re.search(r"salesforce|force\.com|sfdc", combined, re.IGNORECASE):
+                    continue
+
+                case_id = ""
+                for text in [url, title, summary]:
+                    m = re.search(r"500[a-zA-Z0-9]{12,15}", text)
+                    if m:
+                        case_id = m.group()
+                        break
+                if not case_id:
+                    for text in [url, title, summary]:
+                        m = re.search(r"\b(\d{7,10})\b", text)
+                        if m:
+                            case_id = m.group()
+                            break
+
+                if not case_id or case_id in seen_case_ids:
+                    continue
+                seen_case_ids.add(case_id)
+
+                account = ""
+                for text in [title, summary]:
+                    am = re.search(
+                        r"(?:account|customer)\s*[:\-]\s*(.+?)(?:\s*[|;]|$)",
+                        text, re.IGNORECASE,
+                    )
+                    if am:
+                        account = am.group(1).strip()
+                        break
+
+                results.append({"case_id": case_id, "account_name": account})
+    except Exception:
+        pass
+
+    # --- 2. Fetch RFE issue fields for SFDC case number (customfield_12313441) ---
+    try:
+        resp = session.get(
+            f"{jira_url}/rest/api/{api_version}/issue/{rfe_key}",
+            params={"fields": "customfield_12313441"},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            fields = resp.json().get("fields", {})
+            sfdc_field = fields.get("customfield_12313441")
+            if sfdc_field:
+                for case_num in re.split(r"[,\s;|]+", str(sfdc_field).strip()):
+                    case_num = case_num.strip()
+                    if case_num and case_num not in seen_case_ids:
+                        seen_case_ids.add(case_num)
+                        results.append({"case_id": case_num, "account_name": ""})
+    except Exception:
+        pass
+
+    cache[rfe_key] = results
+    return results
+
+
 def fetch_cipoe_summary(
     cipoe_key: str,
     jira_url: str,
@@ -258,6 +407,7 @@ def run_export(
     force_all: bool,
     all_features: bool,
     output_path: Optional[Path],
+    rh_access_token: Optional[str] = None,
 ) -> Path:
     """Export ROX features to CSV. Returns path to created CSV."""
     session = requests.Session()
@@ -350,13 +500,18 @@ def run_export(
         print("⚠️  No features to export")
         if output_path is None:
             output_path = Path(__file__).parent / "rox_features_export_empty.csv"
-        output_path.write_text("key,_sfdc_case_id,_rfe_keys,_customer_names_cipoe\n", encoding="utf-8")
+        output_path.write_text("key,_sfdc_case_id,_rfe_keys,_rfe_sfdc_accounts,_customer_names_cipoe\n", encoding="utf-8")
         return output_path
 
     # Caches
     cipoe_cache: Dict[str, str] = {}
     sfdc_cache: Dict[str, List[str]] = {}
     rfe_links_cache: Dict[str, List[Dict]] = {}
+    rfe_sfdc_cache: Dict[str, List[Dict[str, str]]] = {}
+    case_account_cache: Dict[str, str] = {}
+
+    if rh_access_token:
+        print("🔑 Red Hat API token available — will look up SFDC account names")
 
     # Build CSV rows
     rows = []
@@ -393,6 +548,37 @@ def run_export(
                 customer_names.append(f"{ck}: {name}")
         row["_rfe_keys"] = " | ".join(rfe_keys) if rfe_keys else ""
         row["_customer_names_cipoe"] = " | ".join(customer_names) if customer_names else ""
+
+        # SFDC account names from RFE remote links (ROX -> RFE -> SF case -> Account)
+        rfe_sfdc_entries: List[Dict[str, str]] = []
+        for rfe_key in rfe_keys:
+            entries = fetch_rfe_sfdc_data(
+                rfe_key, jira_url, session, api_version, rfe_sfdc_cache
+            )
+            rfe_sfdc_entries.extend(entries)
+
+        # Enrich with account names from Red Hat Hydra API
+        if rh_access_token and rfe_sfdc_entries:
+            for entry in rfe_sfdc_entries:
+                if entry["account_name"]:
+                    continue
+                acct = fetch_case_account_name(
+                    entry["case_id"], rh_access_token, case_account_cache
+                )
+                if acct:
+                    entry["account_name"] = acct
+
+        if rfe_sfdc_entries:
+            parts = []
+            for e in rfe_sfdc_entries:
+                if e["account_name"]:
+                    parts.append(f"{e['case_id']}: {e['account_name']}")
+                else:
+                    parts.append(e["case_id"])
+            row["_rfe_sfdc_accounts"] = " | ".join(parts)
+        else:
+            row["_rfe_sfdc_accounts"] = ""
+
         rows.append(row)
 
     # Determine output path
@@ -403,13 +589,14 @@ def run_export(
     # Write CSV
     if rows:
         all_keys = list(rows[0].keys())
-        # Order: key, _sfdc_case_id, _rfe_keys, _customer_names_cipoe first, then rest
-        for col in ["key", "_sfdc_case_id", "_rfe_keys", "_customer_names_cipoe"]:
+        priority_cols = [
+            "key", "_sfdc_case_id", "_rfe_keys",
+            "_rfe_sfdc_accounts", "_customer_names_cipoe",
+        ]
+        for col in priority_cols:
             if col in all_keys:
                 all_keys.remove(col)
-        all_keys = ["key", "_sfdc_case_id", "_rfe_keys", "_customer_names_cipoe"] + [
-            k for k in all_keys
-        ]
+        all_keys = [c for c in priority_cols if c in rows[0]] + all_keys
 
         with open(output_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=all_keys, extrasaction="ignore")
@@ -490,6 +677,17 @@ def main():
         print("   Get a token from: https://issues.redhat.com/secure/ViewProfile.jspa?selectedTab=com.atlassian.pats.pats-plugin:jira-user-personal-access-tokens")
         sys.exit(1)
 
+    # Red Hat Customer Portal API for SFDC account lookups
+    rh_access_token = None
+    rh_offline_token = os.getenv("RH_OFFLINE_TOKEN", "").strip()
+    if rh_offline_token:
+        rh_access_token = get_rh_access_token(rh_offline_token)
+        if not rh_access_token:
+            print("⚠️  Could not get Red Hat API access token — account names will be unavailable")
+    else:
+        print("ℹ️  RH_OFFLINE_TOKEN not set — SFDC account names will not be resolved")
+        print("   Get one from: https://access.redhat.com/management/api")
+
     csv_path = run_export(
         jira_url=DEFAULT_JIRA_URL,
         api_token=token,
@@ -497,6 +695,7 @@ def main():
         force_all=args.force_all,
         all_features=args.all_features,
         output_path=args.output,
+        rh_access_token=rh_access_token,
     )
 
     # Save last run timestamp (unless force-all or all-features)
