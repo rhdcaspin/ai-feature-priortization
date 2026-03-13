@@ -1,5 +1,8 @@
 requests>=2.28.0
 python-dotenv>=1.0.0
 
-# Optional: for rox_feature_export_notebooklm.py NotebookLM upload
-# pip install notebooklm-mcp-cli && nlm login
+# Optional: for NotebookLM upload
+# pip install 'notebooklm-py[browser]' && notebooklm login
+
+# Optional: for rhacs_telemetry_export.py direct Snowflake queries
+# pip install snowflake-connector-python
