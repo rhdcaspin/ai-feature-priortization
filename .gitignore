@@ -1,6 +1,9 @@
 # Environment variables
 .env
 
+# Cursor local config (may later hold MCP paths or secrets)
+.cursor/
+
 # ROX export state
 .rox_export_last_run
 
@@ -12,6 +15,12 @@ __pycache__/
 
 # Generated CSV exports
 rox_features_export_*.csv
+rfe_rhacs_export_*.csv
+rfe_rox_mismatch_*.csv
+rhacs_cases_*.csv
+rhacs_telemetry_*.csv
+*_features_report_*.csv
+jira_feature_validation_report_*.txt
 output/
 
 # Google API credentials

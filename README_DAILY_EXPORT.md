@@ -4,13 +4,15 @@ Automated daily process that exports Jira features updated since the last run an
 
 ## Setup (one-time)
 
-1. **Copy (not symlink) the plist to LaunchAgents:**
+1. **Edit paths in `com.rox.daily-export.plist`** so they match your machine: `run_daily_export.sh` location, repo `WorkingDirectory`, and log file paths (or keep logs under `~/Library/Logs/` as in the template).
+
+2. **Copy (not symlink) the plist to LaunchAgents:**
    ```bash
-   cp /Users/dcaspin/Projects/aifeaturepriortization/com.rox.daily-export.plist ~/Library/LaunchAgents/
+   cp /path/to/aifeaturepriortization/com.rox.daily-export.plist ~/Library/LaunchAgents/
    chmod 644 ~/Library/LaunchAgents/com.rox.daily-export.plist
    ```
 
-2. **Load and enable** (pick one that works on your macOS):
+3. **Load and enable** (pick one that works on your macOS):
    ```bash
    # Newer macOS (Sonoma+)
    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.rox.daily-export.plist
@@ -19,7 +21,7 @@ Automated daily process that exports Jira features updated since the last run an
    launchctl load ~/Library/LaunchAgents/com.rox.daily-export.plist
    ```
 
-3. **If you get "Load failed: 5"** — unload first, then reload:
+4. **If you get "Load failed: 5"** — unload first, then reload:
    ```bash
    launchctl bootout gui/$(id -u) com.rox.daily-export 2>/dev/null  # or: launchctl unload ...
    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.rox.daily-export.plist

@@ -1,184 +1,44 @@
-# ROX Feature Validation Tool
+# ROX feature template validation
 
-This guide explains how to use the ROX feature validation tool for analyzing ROX 4.10 features, including template validation and optional comment functionality.
+This repository validates **ROX** Jira **Features** against the product description template (Goal Summary, goals/outcomes, acceptance criteria, success criteria, and optional sections). Completed issues (**Done** status category, for example Closed) are excluded from the main validator query.
 
-## 🚀 Quick Start
+## Which script to use
 
-### 1. Set up Environment Variables
+| Goal | Script | Documentation |
+|------|--------|----------------|
+| Compliance CSV + optional Google Sheets for a **Target Version** | `jira_feature_validator.py` | [docs/scripts/jira_feature_validator.md](docs/scripts/jira_feature_validator.md) |
+| Version labels on issues, PM gap report, same compliance columns, optional **NotebookLM RICE** | `rox_target_version_labels_pm_validation.py` | [docs/scripts/rox_target_version_labels_pm_validation.md](docs/scripts/rox_target_version_labels_pm_validation.md) |
 
-```bash
-# Set your Jira API token
-export JIRA_TOKEN="your_jira_token_here"
+## Quick start
 
-# Or create a .env file
-echo "JIRA_TOKEN=your_jira_token_here" > .env
-```
+1. Copy `.env.example` to `.env` and set `JIRA_TOKEN` (or `JIRA_API_TOKEN`), `JIRA_BASE_URL`, and on Atlassian Cloud `JIRA_EMAIL`. **Do not commit `.env`.**
 
-### 2. Test the Setup
+2. Run the validator (writes under `output/`):
 
-```bash
-# Dry run to see what comments would be added
-python3 daily_validation.py --dry-run
-
-# Generate report without adding comments
-python3 daily_validation.py --skip-comments
-```
-
-### 3. Run Feature Validation
-
-```bash
-# Safe dry run (generates report + shows what comments would be added)
-python3 daily_validation.py --dry-run
-
-# Full validation (generates report + adds comments when confirmed)
-python3 daily_validation.py
-```
-
-## 📋 Available Scripts
-
-### Main Scripts
-
-1. **`rox_csv_generator.py`** - Main analysis script with comment functionality
-2. **`daily_validation.py`** - Simplified daily runner script  
-3. **`add_template_comments.py`** - Standalone comment addition script
-
-### Command Options
-
-#### rox_csv_generator.py
-```bash
-# Generate report with AI analysis
-python3 rox_csv_generator.py
-
-# Add template compliance comments  
-python3 rox_csv_generator.py --add-comments
-
-# Dry run for comments
-python3 rox_csv_generator.py --dry-run-comments
-
-# Clear LLM cache
-python3 rox_csv_generator.py --clear-cache
-
-# Show cache stats
-python3 rox_csv_generator.py --cache-stats
-```
-
-#### daily_validation.py
-```bash
-# Full daily validation
-python3 daily_validation.py
-
-# Dry run (see what would happen)
-python3 daily_validation.py --dry-run
-
-# Report only, no comments
-python3 daily_validation.py --skip-comments
-```
-
-## 🔄 Automation Setup
-
-### Cron Job (Linux/Mac)
-
-```bash
-# Edit crontab
-crontab -e
-
-# Add daily run at 9:00 AM
-0 9 * * * cd /path/to/aifeaturepriortization && /usr/bin/python3 daily_validation.py
-
-# Add weekly dry run on Fridays at 5 PM
-0 17 * * 5 cd /path/to/aifeaturepriortization && /usr/bin/python3 daily_validation.py --dry-run
-```
-
-### Windows Task Scheduler
-
-1. Open Task Scheduler
-2. Create Basic Task
-3. Set trigger to Daily at 9:00 AM
-4. Set action to start program: `python3`
-5. Add arguments: `daily_validation.py`
-6. Set start in: `C:\path\to\aifeaturepriortization`
-
-## 📝 Comment Functionality
-
-### What Comments Are Added
-
-The system automatically adds comments to Jira features that are missing required template sections:
-
-- **Goal Summary**
-- **Goals and expected user outcomes**  
-- **Acceptance Criteria**
-- **Success Criteria or KPIs measured**
-
-### Comment Format
-
-```
-🚨 Template Compliance Issue
-
-Hello @ProductManagerName,
-
-This feature is missing the following required template sections:
-• Goal Summary
-• Goals and expected user outcomes  
-• Acceptance Criteria
-• Success Criteria or KPIs measured
-
-Action Required:
-Please update the feature description to include all required template sections.
-```
-
-### Comment Targeting
-
-- **Product Manager Mentions**: Comments tag the assigned Product Manager
-- **Account ID Resolution**: Proper @mentions using Jira account IDs
-- **Fallback Handling**: Graceful fallback for unassigned features
-
-## 🛠 Troubleshooting
-
-### Common Issues
-
-1. **"JIRA_TOKEN not set"**
    ```bash
-   export JIRA_TOKEN="your_token_here"
+   python3 jira_feature_validator.py --target-version 5.0.0
    ```
 
-2. **"Cannot connect to Jira"**
-   - Check network connectivity
-   - Verify token permissions
-   - Check Jira URL
+3. For label sync + PM report + optional RICE from NotebookLM:
 
-3. **"Ollama not available"**
-   - Ensure Ollama is running: `ollama serve`
-   - Check model availability: `ollama list`
-
-4. **Permission Errors**
    ```bash
-   chmod +x *.py
+   python3 rox_target_version_labels_pm_validation.py --target-version 5.0.0 --dry-run
    ```
 
-### Debug Mode
+## Automation
 
-Run with Python verbose mode to see detailed output:
+Use `cron` or another scheduler to run the same commands on a host that has network access and credentials. Example:
+
 ```bash
-python3 -v daily_validation.py --dry-run
+0 9 * * * cd /path/to/aifeaturepriortization && /usr/bin/python3 jira_feature_validator.py --target-version 5.0.0
 ```
 
-## 📊 Output Files
+## Security
 
-- **CSV Reports**: `rox_4_10_features_YYYYMMDD_HHMMSS.csv`
-- **LLM Cache**: `llm_cache/` directory
-- **Logs**: Console output (redirect to file if needed)
+- Never commit `.env`, API tokens, offline tokens, or Snowflake passwords.
+- Prefer least-privilege Jira tokens and rotate on schedule.
+- See [.env.example](.env.example) for variable names only (placeholders, no real secrets).
 
-## 🔒 Security Notes
+## Further reading
 
-- **Never commit** `.env` files or tokens to git
-- **Use environment variables** for sensitive data
-- **Rotate tokens** regularly according to your organization's policy
-- **Limit token permissions** to minimum required scope
-
-## 🆘 Support
-
-For issues or questions:
-1. Check the troubleshooting section above
-2. Review the console output for error messages
-3. Verify environment setup and permissions
-4. Test with `--dry-run` first
+- [docs/README.md](docs/README.md) — index of all script guides.

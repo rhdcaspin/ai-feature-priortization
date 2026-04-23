@@ -3,17 +3,21 @@
 Jira Feature Template Validator
 
 This script connects to a Jira organization using API token authentication,
-filters features by target version, and validates them against a required template structure.
+filters features by target version (excluding issues in the Done status category, for example Closed),
+and validates them against a required template structure.
 
 Usage:
-    python3 jira_feature_validator.py --target-version 4.11.0
+    python3 jira_feature_validator.py --target-version 5.0.0
     python3 jira_feature_validator.py --target-version 4.12.0
+    python3 jira_feature_validator.py --target-version 5.0.0 --update-sheet   # also push CSV to Google Sheets
 """
 
 import os
 import re
 import json
 import csv
+import subprocess
+import urllib.parse
 import requests
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -23,7 +27,10 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).parent / ".env")
+# Prefer values from project .env over inherited shell env (avoids stale JIRA_* exports).
+load_dotenv(Path(__file__).parent / ".env", override=True)
+
+from jira_auth import is_jira_cloud_url, jira_api_token_from_env  # noqa: E402
 
 
 @dataclass
@@ -47,9 +54,25 @@ class JiraFeatureValidator:
         TemplateSection("use_cases", "Use Cases (Optional):", False, "<your text here>"),
         TemplateSection("out_of_scope", "Out of Scope (Optional):", False, "<your text here>")
     ]
-    
+
+    # Product pillar slugs (same as rox_feature_category_labels.py); exported in CSV as "Pillar classification".
+    PILLAR_CLASSIFICATION_LABELS = (
+        "unified-workload-protection",
+        "frictionless-security-runtime-observability",
+        "ai-driven-vuln-risk-management",
+    )
+
+    @staticmethod
+    def pillar_classification_from_labels(labels: Optional[List[str]]) -> str:
+        """Return pillar label(s) present on the issue, fixed order; empty if none."""
+        if not labels:
+            return ""
+        label_set = {str(x).strip() for x in labels if x}
+        found = [p for p in JiraFeatureValidator.PILLAR_CLASSIFICATION_LABELS if p in label_set]
+        return " | ".join(found)
+
     def __init__(self, jira_url: str, email: str, api_token: str,
-                 project_key: str = "ROX", target_version: str = "4.11.0"):
+                 project_key: str = "ROX", target_version: str = "5.0.0"):
         self.jira_url = jira_url.rstrip('/')
         self.api_token = api_token
         self.email = email
@@ -57,43 +80,165 @@ class JiraFeatureValidator:
         self.target_version = target_version
         self.session = requests.Session()
         
-        # Set up authentication for Red Hat Jira (Bearer token)
-        if 'redhat.com' in jira_url:
+        # Jira Cloud (atlassian.net) uses Basic Auth; Jira Server uses Bearer
+        if is_jira_cloud_url(jira_url):
+            self.session.auth = (email, api_token)
+            self.session.headers.update({
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+            })
+        else:
             self.session.headers.update({
                 'Authorization': f'Bearer {api_token}',
                 'Accept': 'application/json',
-                'Content-Type': 'application/json'
+                'Content-Type': 'application/json',
             })
-        else:
-            # Standard Atlassian Jira (Basic auth)
-            self.session.auth = (email, api_token)
-        
+
+    def product_manager_field(self) -> str:
+        """Custom field id for Product Manager (Cloud vs Server differ)."""
+        fid = os.getenv("JIRA_PRODUCT_MANAGER_FIELD", "").strip()
+        if fid:
+            return fid
+        return "customfield_10469" if is_jira_cloud_url(self.jira_url) else "customfield_12316752"
+
+    def target_version_field(self) -> str:
+        """Custom field id for Target Version (Cloud vs Server differ)."""
+        fid = os.getenv("JIRA_TARGET_VERSION_FIELD", "").strip()
+        if fid:
+            return fid
+        return "customfield_10855" if is_jira_cloud_url(self.jira_url) else "customfield_12319940"
+
+    _rice_cache: Optional[Dict[str, str]] = None
+
+    # Exact Jira field names to match for each RICE dimension.
+    _RICE_FIELD_NAMES: Dict[str, List[str]] = {
+        "reach": ["Reach"],
+        "impact": ["Impact (migrated)", "Impact"],
+        "confidence": ["Confidence"],
+        "effort": ["Effort"],
+    }
+
+    def _discover_rice_fields(self) -> Dict[str, str]:
+        """Auto-discover RICE custom field ids from Jira /rest/api/*/field."""
+        api_version = getattr(self, "api_version", "3" if is_jira_cloud_url(self.jira_url) else "2")
+        try:
+            resp = self.session.get(f"{self.jira_url}/rest/api/{api_version}/field")
+            resp.raise_for_status()
+            all_fields = resp.json()
+        except Exception as e:
+            print(f"   ⚠️  Could not fetch Jira fields for RICE discovery: {e}")
+            return {k: "" for k in self._RICE_FIELD_NAMES}
+
+        name_to_id: Dict[str, str] = {}
+        for f in all_fields:
+            if f.get("custom"):
+                name_to_id[f.get("name", "")] = f.get("id", "")
+
+        result: Dict[str, str] = {}
+        for rice_key, candidates in self._RICE_FIELD_NAMES.items():
+            fid = ""
+            for cand in candidates:
+                if cand in name_to_id:
+                    fid = name_to_id[cand]
+                    break
+            result[rice_key] = fid
+
+        found = {k: v for k, v in result.items() if v}
+        if found:
+            print(f"   🔎 RICE fields discovered: {', '.join(f'{k}={v}' for k, v in found.items())}")
+        return result
+
+    def rice_field_ids(self) -> Dict[str, str]:
+        """Jira custom field ids for RICE. Uses JIRA_RICE_* env vars, or auto-discovers from Jira."""
+        if self._rice_cache is not None:
+            return self._rice_cache
+
+        env_ids = {
+            "reach": os.getenv("JIRA_RICE_REACH_FIELD", "").strip(),
+            "impact": os.getenv("JIRA_RICE_IMPACT_FIELD", "").strip(),
+            "confidence": os.getenv("JIRA_RICE_CONFIDENCE_FIELD", "").strip(),
+            "effort": os.getenv("JIRA_RICE_EFFORT_FIELD", "").strip(),
+        }
+        if all(env_ids.values()):
+            self._rice_cache = env_ids
+            return self._rice_cache
+
+        discovered = self._discover_rice_fields()
+        merged = {k: env_ids[k] or discovered.get(k, "") for k in env_ids}
+        self._rice_cache = merged
+        return self._rice_cache
+
+    def rice_score_field_id(self) -> str:
+        """Jira custom field id for the **RICE Score** field. Env or match by field name in Jira."""
+        env = (os.getenv("JIRA_RICE_SCORE_FIELD") or "").strip()
+        if env:
+            return env
+        if getattr(self, "_rice_score_field_resolved", False):
+            return getattr(self, "_rice_score_field_id", "")
+        self._rice_score_field_resolved = True
+        self._rice_score_field_id = ""
+        api_version = getattr(self, "api_version", "3" if is_jira_cloud_url(self.jira_url) else "2")
+        try:
+            resp = self.session.get(f"{self.jira_url}/rest/api/{api_version}/field")
+            resp.raise_for_status()
+            name_to_id: Dict[str, str] = {}
+            for f in resp.json():
+                if f.get("custom"):
+                    name_to_id[f.get("name", "")] = f.get("id", "")
+            for cand in ("RICE Score", "Rice Score", "RICE score"):
+                if cand in name_to_id:
+                    self._rice_score_field_id = name_to_id[cand]
+                    print(f"   🔎 RICE Score field: {self._rice_score_field_id}")
+                    break
+        except Exception as e:
+            print(f"   ⚠️  Could not discover RICE Score field: {e}")
+        return self._rice_score_field_id
+
+    def get_issue_fields_param(self) -> str:
+        base = (
+            "summary,description,key,status,assignee,created,updated,labels,"
+            f"{self.product_manager_field()},{self.target_version_field()}"
+        )
+        extra = [fid for fid in self.rice_field_ids().values() if fid]
+        rs = self.rice_score_field_id()
+        if rs and rs not in extra:
+            extra.append(rs)
+        if extra:
+            base = f"{base},{','.join(extra)}"
+        return base
+
     def test_connection(self) -> bool:
         """Test the Jira connection"""
+        self.is_cloud = is_jira_cloud_url(self.jira_url)
+        api_version = "3" if self.is_cloud else "2"
         try:
-            # Try API v2 first for Red Hat Jira, then v3
-            for api_version in ['2', '3']:
-                try:
-                    response = self.session.get(f"{self.jira_url}/rest/api/{api_version}/myself")
-                    response.raise_for_status()
-                    
-                    # Check if response is JSON
-                    try:
-                        user_data = response.json()
-                    except ValueError:
-                        print(f"⚠️  API {api_version} returned non-JSON response: {response.text[:100]}")
-                        continue
-                        
-                    print(f"✅ Connected to Jira as: {user_data.get('displayName', 'Unknown')}")
-                    print(f"   Using API version: {api_version}")
-                    # Store working API version
-                    self.api_version = api_version
-                    return True
-                except requests.exceptions.HTTPError as e:
-                    print(f"⚠️  API {api_version} failed with HTTP {e.response.status_code}")
-                    continue
-            
-            print(f"❌ Failed to connect with both API v2 and v3")
+            response = self.session.get(f"{self.jira_url}/rest/api/{api_version}/myself")
+            response.raise_for_status()
+            user_data = response.json()
+            print(f"✅ Connected to Jira as: {user_data.get('displayName', 'Unknown')}")
+            print(f"   Using API version: {api_version}")
+            self.api_version = api_version
+            return True
+        except requests.HTTPError as e:
+            err_s = str(e)
+            print(f"❌ Failed to connect to Jira: {e}")
+            if "atlassian.net" in err_s and "/rest/api/2/" in err_s:
+                print(
+                    "   Atlassian Cloud was called with API v2 (wrong mode). Use the latest script, "
+                    "check JIRA_BASE_URL in .env, and run `printenv JIRA_BASE_URL` — old shell exports "
+                    "used to win before .env; this script now prefers .env."
+                )
+            resp = e.response
+            if resp is not None and resp.status_code == 401 and self.is_cloud:
+                if not (self.email or "").strip():
+                    print(
+                        "   Hint: set JIRA_EMAIL to the Atlassian account email paired with your API token."
+                    )
+                else:
+                    print(
+                        "   Hint: confirm JIRA_TOKEN (or JIRA_API_TOKEN) is a current API token for that email; "
+                        "revoke old tokens and create a new one if unsure."
+                    )
             return False
         except Exception as e:
             print(f"❌ Failed to connect to Jira: {e}")
@@ -105,8 +250,9 @@ class JiraFeatureValidator:
         
         jql_parts = [
             f'project = {self.project_key}',
-            f'"Target Version" = {self.target_version}',
-            'type = feature'
+            f'"Target Version" = "{self.target_version}"',
+            'type = feature',
+            'statusCategory != Done',
         ]
         
         jql = ' AND '.join(jql_parts)
@@ -114,38 +260,48 @@ class JiraFeatureValidator:
         print(f"🔍 Using JQL: {jql}")
         
         features = []
-        start_at = 0
         max_results = 50
+        fields_param = self.get_issue_fields_param()
+        is_cloud = getattr(self, "is_cloud", is_jira_cloud_url(self.jira_url))
+        api_version = getattr(self, 'api_version', '3')
         
-        while True:
-            try:
-                params = {
-                    'jql': jql,
-                    'startAt': start_at,
-                    'maxResults': max_results,
-                    'fields': 'summary,description,key,status,assignee,created,updated,customfield_12316752,customfield_12319940'
-                }
-                
-                # Use the API version that worked in connection test
-                api_version = getattr(self, 'api_version', '2')
-                response = self.session.get(
-                    f"{self.jira_url}/rest/api/{api_version}/search",
-                    params=params
-                )
-                response.raise_for_status()
-                data = response.json()
-                
-                issues = data.get('issues', [])
-                features.extend(issues)
-                
-                if len(issues) < max_results:
-                    break
-                    
-                start_at += max_results
-                
-            except Exception as e:
-                print(f"❌ Error fetching features: {e}")
-                break
+        try:
+            if is_cloud:
+                search_url = f"{self.jira_url}/rest/api/3/search/jql"
+                next_token = None
+                while True:
+                    params: dict = {
+                        'jql': jql, 'maxResults': max_results,
+                        'fields': fields_param,
+                    }
+                    if next_token:
+                        params['nextPageToken'] = next_token
+                    response = self.session.get(search_url, params=params)
+                    response.raise_for_status()
+                    data = response.json()
+                    features.extend(data.get('issues', []))
+                    if data.get('isLast', True):
+                        break
+                    next_token = data.get('nextPageToken')
+                    if not next_token:
+                        break
+            else:
+                search_url = f"{self.jira_url}/rest/api/{api_version}/search"
+                start_at = 0
+                while True:
+                    response = self.session.get(search_url, params={
+                        'jql': jql, 'startAt': start_at,
+                        'maxResults': max_results, 'fields': fields_param,
+                    })
+                    response.raise_for_status()
+                    data = response.json()
+                    issues = data.get('issues', [])
+                    features.extend(issues)
+                    if len(issues) < max_results:
+                        break
+                    start_at += max_results
+        except Exception as e:
+            print(f"❌ Error fetching features: {e}")
         
         print(f"📊 Found {len(features)} {self.target_version} features")
         return features
@@ -177,7 +333,33 @@ class JiraFeatureValidator:
                 sections[section.name] = ""
         
         return sections
-    
+
+    @staticmethod
+    def description_to_plain_text(description) -> str:
+        """Convert Jira description to plain text (handles ADF on Jira Cloud)."""
+        if description is None:
+            return ""
+        if isinstance(description, str):
+            return description
+        if isinstance(description, dict):
+            if description.get("type") == "doc":
+                parts: List[str] = []
+
+                def walk(node: dict) -> None:
+                    if not isinstance(node, dict):
+                        return
+                    if node.get("type") == "text" and "text" in node:
+                        parts.append(node["text"])
+                    for child in node.get("content") or []:
+                        walk(child)
+                    if node.get("type") in ("paragraph", "heading", "bulletList", "orderedList"):
+                        parts.append("\n")
+
+                walk(description)
+                return "".join(parts).strip()
+            return str(description)
+        return str(description)
+
     def validate_section(self, section: TemplateSection, content: str) -> Tuple[bool, str]:
         """
         Validate a template section
@@ -220,8 +402,9 @@ class JiraFeatureValidator:
         """
         key = feature.get('key', 'Unknown')
         summary = feature.get('fields', {}).get('summary', 'No summary')
-        description = feature.get('fields', {}).get('description', '')
-        
+        raw_desc = feature.get('fields', {}).get('description', '')
+        description = self.description_to_plain_text(raw_desc)
+
         # Extract sections from description
         sections = self.extract_template_sections(description)
         
@@ -261,18 +444,57 @@ class JiraFeatureValidator:
         if not field_value:
             return ""
         if isinstance(field_value, dict):
-            return field_value.get("displayName", "")
+            return (
+                field_value.get("displayName")
+                or field_value.get("name")
+                or field_value.get("emailAddress")
+                or field_value.get("accountId")
+                or ""
+            )
         return str(field_value)
 
     def _extract_version_name(self, field_value) -> str:
         if not field_value:
             return ""
-        if isinstance(field_value, list) and field_value:
-            item = field_value[0]
-            return item.get("name", str(item)) if isinstance(item, dict) else str(item)
+        if isinstance(field_value, list):
+            names: List[str] = []
+            for item in field_value:
+                if isinstance(item, dict):
+                    n = item.get("name")
+                    if n:
+                        names.append(n)
+                elif item:
+                    names.append(str(item))
+            return " | ".join(names)
         if isinstance(field_value, dict):
             return field_value.get("name", str(field_value))
         return str(field_value)
+
+    @staticmethod
+    def _extract_custom_scalar(field_value) -> str:
+        """String for CSV export from a number, string, or Jira option-style custom field."""
+        if field_value is None:
+            return ""
+        if isinstance(field_value, bool):
+            return "true" if field_value else "false"
+        if isinstance(field_value, int):
+            return str(field_value)
+        if isinstance(field_value, float):
+            return str(int(field_value)) if field_value == int(field_value) else str(field_value)
+        if isinstance(field_value, str):
+            return field_value.strip()
+        if isinstance(field_value, dict):
+            if "value" in field_value and field_value["value"] is not None:
+                v = field_value["value"]
+                if isinstance(v, (int, float)):
+                    return str(int(v)) if isinstance(v, float) and v == int(v) else str(v)
+                return str(v).strip()
+            if "name" in field_value:
+                return str(field_value["name"]).strip()
+        if isinstance(field_value, list) and field_value:
+            parts = [JiraFeatureValidator._extract_custom_scalar(x) for x in field_value]
+            return " | ".join(p for p in parts if p)
+        return str(field_value).strip()
 
     def generate_compliance_csv(self, features: List[Dict],
                                 validation_results: List[Dict]) -> str:
@@ -284,12 +506,17 @@ class JiraFeatureValidator:
         csv_path = output_dir / f"rox_{version_tag}_compliance_{timestamp}.csv"
 
         section_headers = [s.header for s in self.TEMPLATE_SECTIONS]
+        rice_cols = ["Reach", "Impact", "Confidence", "Effort", "RICE Score"]
         fieldnames = [
             "Key", "Summary", "Status", "Assignee", "Product Manager",
-            "Target Version", "Compliant", "Required Missing",
+            "Target Version", "Labels", "Pillar classification",
+            *rice_cols,
+            "Compliant", "Required Missing",
         ] + section_headers
 
         feature_map = {f.get("key"): f for f in features}
+        rice_ids = self.rice_field_ids()
+        rice_score_id = self.rice_score_field_id()
 
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -304,8 +531,31 @@ class JiraFeatureValidator:
                     "Summary": result["summary"],
                     "Status": (fields.get("status") or {}).get("name", ""),
                     "Assignee": (fields.get("assignee") or {}).get("displayName", "Unassigned"),
-                    "Product Manager": self._extract_display_name(fields.get("customfield_12316752")),
-                    "Target Version": self._extract_version_name(fields.get("customfield_12319940")),
+                    "Product Manager": self._extract_display_name(
+                        fields.get(self.product_manager_field())
+                    ),
+                    "Target Version": self._extract_version_name(
+                        fields.get(self.target_version_field())
+                    ),
+                    "Labels": " | ".join(fields.get("labels") or []),
+                    "Pillar classification": self.pillar_classification_from_labels(
+                        fields.get("labels") or []
+                    ),
+                    "Reach": self._extract_custom_scalar(
+                        fields.get(rice_ids["reach"]) if rice_ids["reach"] else None
+                    ),
+                    "Impact": self._extract_custom_scalar(
+                        fields.get(rice_ids["impact"]) if rice_ids["impact"] else None
+                    ),
+                    "Confidence": self._extract_custom_scalar(
+                        fields.get(rice_ids["confidence"]) if rice_ids["confidence"] else None
+                    ),
+                    "Effort": self._extract_custom_scalar(
+                        fields.get(rice_ids["effort"]) if rice_ids["effort"] else None
+                    ),
+                    "RICE Score": self._extract_custom_scalar(
+                        fields.get(rice_score_id) if rice_score_id else None
+                    ),
                     "Compliant": "Yes" if result["overall_valid"] else "No",
                     "Required Missing": result["required_missing"],
                 }
@@ -325,18 +575,23 @@ class JiraFeatureValidator:
         print(f"✅ Compliance CSV saved: {csv_path}")
         return str(csv_path)
     
-    def run_validation(self) -> None:
-        """Run the complete validation process"""
+    def run_validation(self) -> Optional[str]:
+        """Run the complete validation process. Returns CSV path on success."""
         print(f"🚀 Starting ROX {self.target_version} Feature Analysis and Template Validation")
         print("=" * 60)
+        _cloud = is_jira_cloud_url(self.jira_url)
+        print(
+            f"🔗 Jira: {self.jira_url}  "
+            f"({'Cloud — API v3 + email/token' if _cloud else 'Server/Data Center — API v2 + Bearer'})"
+        )
 
         if not self.test_connection():
-            return
+            return None
 
         features = self.get_features()
         if not features:
             print(f"⚠️  No {self.target_version} features found")
-            return
+            return None
 
         print("🔍 Validating features against template...")
         validation_results = []
@@ -355,25 +610,124 @@ class JiraFeatureValidator:
         print(f"Compliant: {compliant} ({compliant / total * 100:.1f}%)")
         print(f"Non-compliant: {total - compliant} ({(total - compliant) / total * 100:.1f}%)")
         print(f"\n📄 Report: {csv_path}")
+        return csv_path
+
+
+DEFAULT_SPREADSHEET_ID = "1pLLm_1VrQHFpWCg7Z6JZXJGInlMtA9vB1I9Hsw97Fy8"
+DEFAULT_SHEET_NAME = "5.0 Plan"
+
+
+def _get_gcloud_access_token() -> Optional[str]:
+    """Get a Google access token from gcloud CLI (requires --enable-gdrive-access)."""
+    try:
+        token = subprocess.check_output(
+            ["gcloud", "auth", "print-access-token"],
+            text=True, stderr=subprocess.DEVNULL, timeout=10,
+        ).strip()
+        return token if token else None
+    except Exception:
+        return None
+
+
+def upload_csv_to_google_sheet(
+    csv_path: str,
+    spreadsheet_id: str,
+    sheet_name: str,
+) -> bool:
+    """Replace a Google Sheets tab with the contents of a CSV file.
+
+    Uses the gcloud CLI access token (requires prior
+    ``gcloud auth login --enable-gdrive-access``).
+    """
+    token = _get_gcloud_access_token()
+    if not token:
+        print(
+            "⚠️  Could not get gcloud access token for Google Sheets.\n"
+            "   Run: gcloud auth login --enable-gdrive-access"
+        )
+        return False
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    base = "https://sheets.googleapis.com/v4/spreadsheets"
+
+    with open(csv_path, encoding="utf-8") as f:
+        rows = list(csv.reader(f))
+
+    if not rows:
+        print("⚠️  CSV is empty, skipping Sheets upload")
+        return False
+
+    encoded_sheet = urllib.parse.quote(sheet_name, safe="")
+    # Clear the whole tab (A:ZZ) so manual edits anywhere are removed; sheet names
+    # with spaces must be URL-encoded or the clear request can miss the tab.
+    clear_range = f"{encoded_sheet}!A:ZZ"
+    clear_url = f"{base}/{spreadsheet_id}/values/{clear_range}:clear"
+    resp = requests.post(clear_url, headers=headers)
+    if resp.status_code == 403:
+        print(
+            "⚠️  Google Sheets 403 — run: gcloud auth login --enable-gdrive-access"
+        )
+        return False
+    if resp.status_code not in (200, 201):
+        print(f"⚠️  Clear failed: {resp.status_code} {resp.text[:200]}")
+        return False
+
+    # Write new data
+    write_url = (
+        f"{base}/{spreadsheet_id}/values/{encoded_sheet}!A1"
+        f"?valueInputOption=RAW"
+    )
+    resp = requests.put(write_url, headers=headers, json={"values": rows})
+    if resp.status_code == 200:
+        result = resp.json()
+        print(
+            f"✅ Google Sheet updated: {result.get('updatedRows')} rows × "
+            f"{result.get('updatedColumns')} cols"
+        )
+        return True
+
+    print(f"⚠️  Write failed: {resp.status_code} {resp.text[:200]}")
+    return False
 
 
 def main():
     parser = argparse.ArgumentParser(
         description='Validate ROX features against the required template structure'
     )
-    parser.add_argument('--target-version', default='4.11.0',
-                        help='Target version to validate (default: 4.11.0)')
-    parser.add_argument('--jira-url', default=os.getenv('JIRA_BASE_URL', 'https://issues.redhat.com'),
-                        help='Jira base URL')
+    parser.add_argument('--target-version', default='5.0.0',
+                        help='Target version to validate (default: 5.0.0)')
+    parser.add_argument(
+        '--jira-url',
+        default=os.getenv('JIRA_BASE_URL', 'https://redhat.atlassian.net'),
+        help='Jira base URL (default: RH Cloud; set JIRA_BASE_URL=https://issues.redhat.com for legacy PAT-only)',
+    )
     parser.add_argument('--email', default=os.getenv('JIRA_EMAIL', ''),
-                        help='Jira email (optional for Red Hat Jira)')
-    parser.add_argument('--token', default=os.getenv('JIRA_TOKEN', ''),
-                        help='Jira API token (default: JIRA_TOKEN from .env)')
+                        help='Atlassian account email (required for *.atlassian.net; optional for Bearer/Jira Server)')
+    parser.add_argument('--token', default=jira_api_token_from_env(),
+                        help='Jira API token (default: JIRA_TOKEN or JIRA_API_TOKEN from .env)')
+    parser.add_argument('--update-sheet', action='store_true',
+                        help='Upload compliance CSV to Google Sheets after generation')
+    parser.add_argument('--sheet-id',
+                        default=os.getenv('GOOGLE_SHEET_ID', DEFAULT_SPREADSHEET_ID),
+                        help='Google Spreadsheet ID to update')
+    parser.add_argument('--sheet-name',
+                        default=os.getenv('GOOGLE_SHEET_NAME', DEFAULT_SHEET_NAME),
+                        help='Sheet tab name to replace (default: "5.0 Plan")')
 
     args = parser.parse_args()
 
     if not args.token:
-        print("❌ JIRA_TOKEN not set. Provide --token or set it in .env")
+        print("❌ JIRA_TOKEN / JIRA_API_TOKEN not set. Provide --token or set one in .env")
+        return 1
+
+    if is_jira_cloud_url(args.jira_url) and not (args.email or "").strip():
+        print(
+            "❌ Jira Cloud (atlassian.net) requires JIRA_EMAIL: your Atlassian account email "
+            "(the same account you used to create the API token). Set JIRA_EMAIL in .env or pass --email."
+        )
         return 1
 
     try:
@@ -384,7 +738,11 @@ def main():
             project_key="ROX",
             target_version=args.target_version,
         )
-        validator.run_validation()
+        csv_path = validator.run_validation()
+
+        if csv_path and args.update_sheet:
+            print(f"\n📤 Uploading to Google Sheets...")
+            upload_csv_to_google_sheet(csv_path, args.sheet_id, args.sheet_name)
     except KeyboardInterrupt:
         print("\n⚠️  Validation interrupted by user")
     except Exception as e:

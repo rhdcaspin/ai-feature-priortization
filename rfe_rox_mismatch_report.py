@@ -1,21 +1,15 @@
 #!/usr/bin/env python3
 """
-RFE (Feature Request) Export to CSV and NotebookLM
+RFE / ROX Mismatch Report
 
-Exports Feature Requests from the RFE Jira project whose component names
-contain "rhacs".  Supports incremental daily runs (only new/updated RFEs
-since last run) and full exports.
-
-Data enrichment per RFE:
-  - SFDC case IDs and customer account names (via Red Hat Hydra API)
-  - Linked CIPOE customer names
-  - Linked ROX feature keys
+Finds RHACS RFE items that are still open but have linked ROX features
+that are already closed.  Helps identify feature requests that may need
+to be closed or updated after the corresponding ROX work has shipped.
 
 Usage:
-    python3 rfe_export.py                  # incremental (since last run)
-    python3 rfe_export.py --force-all      # all open RHACS RFEs
-    python3 rfe_export.py --all-rfes       # every RHACS RFE regardless of status
-    python3 rfe_export.py --skip-upload    # CSV only, no NotebookLM upload
+    python3 rfe_rox_mismatch_report.py                  # default run
+    python3 rfe_rox_mismatch_report.py --skip-upload    # CSV only
+    python3 rfe_rox_mismatch_report.py -o report.csv    # custom output path
 """
 
 import os
@@ -24,7 +18,7 @@ import csv
 import json
 import argparse
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
@@ -36,31 +30,13 @@ load_dotenv(Path(__file__).parent / ".env")
 from jira_auth import is_jira_cloud_url, jira_api_token_from_env  # noqa: E402
 from notebooklm_upload import notebooklm_upload_available, upload_csvs_to_notebook  # noqa: E402
 
-DEFAULT_STATE_FILE = Path(__file__).parent / ".rfe_export_last_run"
 DEFAULT_JIRA_URL = "https://issues.redhat.com"
 DEFAULT_NOTEBOOK_NAME = "The Big Notebook for RHACS Product Management"
 
 RH_SSO_TOKEN_URL = "https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token"
 RH_HYDRA_CASE_URL = "https://access.redhat.com/hydra/rest/cases"
 
-RHACS_COMPONENTS = [
-    "rhacs",
-    "rhacs-Auth-Authz",
-    "rhacs-compliance",
-    "rhacs-documentation",
-    "rhacs-integration",
-    "rhacs-network-graph",
-    "rhacs-observability",
-    "rhacs-operator",
-    "rhacs-policy",
-    "rhacs-risk",
-    "rhacs-runtime",
-    "rhacs-scanner",
-    "rhacs-ui",
-    "rhacs-vuln-management",
-]
-
-FIELD_IDS = [
+RFE_FIELD_IDS = [
     "key", "summary", "description", "status", "assignee", "reporter",
     "issuetype", "priority", "labels", "components", "fixVersions",
     "created", "updated", "resolution", "resolutiondate",
@@ -68,20 +44,17 @@ FIELD_IDS = [
     "customfield_12311940",   # Rank
     "customfield_12313440",   # SFDC Cases Counter
     "customfield_12313441",   # SFDC Cases Links
-    "customfield_12316542",   # Ready
-    "customfield_12316543",   # Blocked
-    "customfield_12316544",   # Blocked Reason
-    "customfield_12320040",   # Activity Type
-    "customfield_12320845",   # Color Status
-    "customfield_12320946",   # Intelligence Requested
-    "customfield_12320947",   # Market
     "customfield_12322244",   # PX Impact Score
-    "customfield_12324540",   # SFDC Cases Open
 ]
+
+ROX_STATUS_FIELDS = "key,summary,status,resolution,resolutiondate,fixVersions"
+
+CLOSED_STATUSES = frozenset([
+    "closed", "done", "resolved", "verified", "release pending",
+])
 
 
 def flatten_value(val: Any) -> str:
-    """Convert a Jira field value to a CSV-safe string."""
     if val is None:
         return ""
     if isinstance(val, bool):
@@ -108,7 +81,6 @@ def flatten_value(val: Any) -> str:
 
 
 def get_rh_access_token(offline_token: str) -> Optional[str]:
-    """Exchange a Red Hat offline token for a short-lived access token."""
     try:
         resp = requests.post(
             RH_SSO_TOKEN_URL,
@@ -130,7 +102,6 @@ def get_rh_access_token(offline_token: str) -> Optional[str]:
 def fetch_case_account_name(
     case_number: str, access_token: str, cache: Dict[str, str],
 ) -> str:
-    """Look up the account/customer name for a support case via Hydra API."""
     if case_number in cache:
         return cache[case_number]
     try:
@@ -164,7 +135,6 @@ def fetch_case_account_name(
 def extract_sfdc_case_ids(rfe_fields: Dict, rfe_key: str,
                           jira_url: str, session: requests.Session,
                           api_version: str) -> List[str]:
-    """Extract SFDC case IDs from custom fields and remote links of an RFE."""
     seen: set = set()
     case_ids: list = []
 
@@ -210,7 +180,6 @@ def extract_sfdc_case_ids(rfe_fields: Dict, rfe_key: str,
 
 
 def extract_linked_keys(issuelinks: List[Dict], prefix: str) -> List[str]:
-    """Extract linked issue keys matching a project prefix (e.g. 'CIPOE', 'ROX')."""
     keys = []
     for link in issuelinks or []:
         for direction in ("inwardIssue", "outwardIssue"):
@@ -226,7 +195,6 @@ def fetch_cipoe_summary(
     cipoe_key: str, jira_url: str, session: requests.Session,
     api_version: str, cache: Dict[str, str],
 ) -> str:
-    """Fetch CIPOE issue summary (customer name) with caching."""
     if cipoe_key in cache:
         return cache[cipoe_key]
     try:
@@ -245,33 +213,64 @@ def fetch_cipoe_summary(
     return cipoe_key
 
 
-def load_last_run(state_file: Path) -> Optional[str]:
-    if not state_file.exists():
-        return None
+def fetch_rox_issue(
+    rox_key: str, jira_url: str, session: requests.Session,
+    api_version: str, cache: Dict[str, Dict],
+) -> Optional[Dict]:
+    """Fetch a ROX issue's key fields (status, resolution, fixVersions)."""
+    if rox_key in cache:
+        return cache[rox_key]
     try:
-        return state_file.read_text().strip()
+        resp = session.get(
+            f"{jira_url}/rest/api/{api_version}/issue/{rox_key}",
+            params={"fields": ROX_STATUS_FIELDS},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            cache[rox_key] = data
+            return data
+        elif resp.status_code == 404:
+            cache[rox_key] = None
     except Exception:
-        return None
+        pass
+    cache[rox_key] = None
+    return None
 
 
-def save_last_run(state_file: Path, timestamp: str) -> None:
+def is_closed(status_name: str) -> bool:
+    return status_name.lower().strip() in CLOSED_STATUSES
+
+
+def fetch_rhacs_components(
+    jira_url: str, session: requests.Session, api_version: str,
+) -> List[str]:
+    """Fetch all RFE project components whose name contains 'rhacs' (case-insensitive)."""
     try:
-        state_file.write_text(timestamp)
+        resp = session.get(
+            f"{jira_url}/rest/api/{api_version}/project/RFE/components",
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            all_components = resp.json()
+            matched = [
+                c["name"] for c in all_components
+                if "rhacs" in c.get("name", "").lower()
+            ]
+            return sorted(matched)
     except Exception as e:
-        print(f"  Could not save state file: {e}")
+        print(f"  Could not fetch RFE components: {e}")
+    return []
 
 
-def run_export(
+def run_report(
     jira_url: str,
     api_token: str,
-    state_file: Path,
-    force_all: bool,
-    all_rfes: bool,
     output_path: Optional[Path],
     rh_access_token: Optional[str] = None,
     jira_email: Optional[str] = None,
 ) -> Path:
-    """Export RHACS RFEs to CSV. Returns path to created CSV."""
+    """Find open RHACS RFEs whose linked ROX features are closed."""
     session = requests.Session()
     session.headers.update({
         "Accept": "application/json",
@@ -289,54 +288,32 @@ def run_export(
         r = session.get(f"{jira_url}/rest/api/{api_version}/serverInfo", timeout=10)
         if r.status_code == 200:
             print(f"Connected to Jira (API v{api_version})")
-        else:
-            print(f"Connected to Jira (API v{api_version}, serverInfo returned {r.status_code})")
     except Exception:
         print(f"Connected to Jira (API v{api_version})")
 
-    component_list = ", ".join(f'"{c}"' for c in RHACS_COMPONENTS)
+    # ── 1. Fetch all open RHACS RFEs ──
+    rhacs_components = fetch_rhacs_components(jira_url, session, api_version)
+    if not rhacs_components:
+        print("No components containing 'rhacs' found in RFE project")
+        sys.exit(1)
+    print(f"Found {len(rhacs_components)} RHACS components: {', '.join(rhacs_components)}")
+
+    component_list = ", ".join(f'"{c}"' for c in rhacs_components)
     component_filter = f"component in ({component_list})"
+    status_filter = 'status in (New, Open, "In Progress", "To Do", Backlog, Refinement, "Under Consideration")'
+    jql = f"project = RFE AND {component_filter} AND {status_filter} ORDER BY updated DESC"
 
-    if all_rfes:
-        jql = f"project = RFE AND {component_filter} ORDER BY updated DESC"
-        print("Exporting ALL RHACS RFEs (--all-rfes)")
-    else:
-        status_filter = 'status in (New, Open, "In Progress", "To Do", Backlog, Refinement, "Under Consideration")'
-        base_filter = f"project = RFE AND {component_filter} AND {status_filter}"
+    print("Fetching open RHACS RFEs...")
 
-        if force_all:
-            jql = f"{base_filter} ORDER BY updated DESC"
-            print("Exporting open RHACS RFEs (--force-all)")
-        else:
-            last_run = load_last_run(state_file)
-            if last_run:
-                try:
-                    dt = datetime.fromisoformat(last_run.replace("Z", "+00:00"))
-                    date_str = dt.strftime("%Y-%m-%d")
-                    jql = f'{base_filter} AND updated >= "{date_str}" ORDER BY updated DESC'
-                    print(f"Exporting RHACS RFEs updated since {last_run}")
-                except Exception:
-                    jql = f"{base_filter} ORDER BY updated DESC"
-                    print("Exporting open RHACS RFEs (invalid state file)")
-            else:
-                since = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-                jql = f'{base_filter} AND updated >= "{since}" ORDER BY updated DESC'
-                print(f"First run: exporting RHACS RFEs updated since {since}")
-
-    fields_param = ",".join(FIELD_IDS)
-
-    all_issues = []
+    fields_param = ",".join(RFE_FIELD_IDS)
+    all_rfe_issues: List[Dict] = []
     max_results = 50
 
     if is_cloud:
         search_url = f"{jira_url}/rest/api/3/search/jql"
         next_token = None
         while True:
-            params: dict = {
-                "jql": jql,
-                "maxResults": max_results,
-                "fields": fields_param,
-            }
+            params: dict = {"jql": jql, "maxResults": max_results, "fields": fields_param}
             if next_token:
                 params["nextPageToken"] = next_token
             resp = session.get(search_url, params=params, timeout=60)
@@ -345,8 +322,8 @@ def run_export(
                 print(resp.text[:500])
                 sys.exit(1)
             data = resp.json()
-            all_issues.extend(data.get("issues", []))
-            print(f"  Fetched {len(all_issues)} RFEs...", end="\r")
+            all_rfe_issues.extend(data.get("issues", []))
+            print(f"  Fetched {len(all_rfe_issues)} RFEs...", end="\r")
             if data.get("isLast", True):
                 break
             next_token = data.get("nextPageToken")
@@ -366,24 +343,26 @@ def run_export(
                 sys.exit(1)
             data = resp.json()
             issues = data.get("issues", [])
-            all_issues.extend(issues)
-            print(f"  Fetched {len(all_issues)}/{data.get('total', '?')} RFEs...", end="\r")
+            all_rfe_issues.extend(issues)
+            print(f"  Fetched {len(all_rfe_issues)}/{data.get('total', '?')} RFEs...", end="\r")
             if len(issues) < max_results:
                 break
             start_at += max_results
 
-    print(f"Retrieved {len(all_issues)} RHACS RFEs       ")
+    print(f"Retrieved {len(all_rfe_issues)} open RHACS RFEs          ")
 
-    if not all_issues:
-        print("No RFEs to export")
+    if not all_rfe_issues:
+        print("No open RHACS RFEs found")
         if output_path is None:
-            output_path = Path(__file__).parent / "rfe_export_empty.csv"
+            output_path = Path(__file__).parent / "rfe_rox_mismatch_empty.csv"
         output_path.write_text(
-            "key,summary,status,components,_sfdc_case_ids,_sfdc_accounts,_cipoe_customers,_rox_keys\n",
+            "rfe_key,rfe_summary,rfe_status,rox_key,rox_summary,rox_status,rox_resolution,rox_fix_versions\n",
             encoding="utf-8",
         )
         return output_path
 
+    # ── 2. For each RFE, check linked ROX features ──
+    rox_cache: Dict[str, Optional[Dict]] = {}
     cipoe_cache: Dict[str, str] = {}
     case_account_cache: Dict[str, str] = {}
 
@@ -391,25 +370,33 @@ def run_export(
         print("Red Hat API token available - will look up SFDC account names")
 
     rows = []
-    for idx, issue in enumerate(all_issues):
-        fields = issue.get("fields", {})
-        issue_key = issue.get("key", "")
-        issuelinks = fields.get("issuelinks", [])
+    rfe_with_links = 0
+    mismatches_found = 0
+
+    for idx, rfe_issue in enumerate(all_rfe_issues):
+        rfe_fields = rfe_issue.get("fields", {})
+        rfe_key = rfe_issue.get("key", "")
+        rfe_summary = flatten_value(rfe_fields.get("summary"))
+        rfe_status = flatten_value(rfe_fields.get("status"))
+        rfe_priority = flatten_value(rfe_fields.get("priority"))
+        rfe_components = flatten_value(rfe_fields.get("components"))
+        rfe_rank = flatten_value(rfe_fields.get("customfield_12311940"))
+        rfe_px_score = flatten_value(rfe_fields.get("customfield_12322244"))
+        rfe_created = flatten_value(rfe_fields.get("created"))
+        rfe_updated = flatten_value(rfe_fields.get("updated"))
+        issuelinks = rfe_fields.get("issuelinks", [])
 
         if (idx + 1) % 20 == 0:
-            print(f"  Processing {idx + 1}/{len(all_issues)}...", end="\r")
+            print(f"  Processing RFE {idx + 1}/{len(all_rfe_issues)}...", end="\r")
 
-        row = {"key": issue_key}
-        for fid, fval in fields.items():
-            row[fid] = flatten_value(fval)
+        rox_keys = extract_linked_keys(issuelinks, "ROX")
+        if not rox_keys:
+            continue
 
-        # SFDC case IDs from custom field + remote links
-        sfdc_ids = extract_sfdc_case_ids(
-            fields, issue_key, jira_url, session, api_version
-        )
-        row["_sfdc_case_ids"] = " | ".join(sfdc_ids) if sfdc_ids else ""
+        rfe_with_links += 1
 
-        # Resolve SFDC account names via Hydra API
+        # SFDC enrichment
+        sfdc_ids = extract_sfdc_case_ids(rfe_fields, rfe_key, jira_url, session, api_version)
         sfdc_accounts = []
         if rh_access_token and sfdc_ids:
             for cid in sfdc_ids:
@@ -418,46 +405,69 @@ def run_export(
                     sfdc_accounts.append(f"{cid}: {acct}")
                 else:
                     sfdc_accounts.append(cid)
-        row["_sfdc_accounts"] = " | ".join(sfdc_accounts) if sfdc_accounts else ""
 
-        # CIPOE customer names
         cipoe_keys = extract_linked_keys(issuelinks, "CIPOE")
         customer_names = []
         for ck in cipoe_keys:
-            name = fetch_cipoe_summary(
-                ck, jira_url, session, api_version, cipoe_cache
-            )
+            name = fetch_cipoe_summary(ck, jira_url, session, api_version, cipoe_cache)
             if name:
                 customer_names.append(f"{ck}: {name}")
-        row["_cipoe_customers"] = " | ".join(customer_names) if customer_names else ""
 
-        # Linked ROX features
-        rox_keys = extract_linked_keys(issuelinks, "ROX")
-        row["_rox_keys"] = " | ".join(rox_keys) if rox_keys else ""
+        # Check each linked ROX feature
+        for rox_key in rox_keys:
+            rox_issue = fetch_rox_issue(rox_key, jira_url, session, api_version, rox_cache)
+            if rox_issue is None:
+                continue
 
-        rows.append(row)
+            rox_fields = rox_issue.get("fields", {})
+            rox_status_name = flatten_value(rox_fields.get("status"))
 
-    print(f"  Processed {len(all_issues)} RFEs              ")
+            if not is_closed(rox_status_name):
+                continue
+
+            mismatches_found += 1
+            rows.append({
+                "rfe_key": rfe_key,
+                "rfe_summary": rfe_summary,
+                "rfe_status": rfe_status,
+                "rfe_priority": rfe_priority,
+                "rfe_components": rfe_components,
+                "rfe_rank": rfe_rank,
+                "rfe_px_impact_score": rfe_px_score,
+                "rfe_created": rfe_created,
+                "rfe_updated": rfe_updated,
+                "rox_key": rox_key,
+                "rox_summary": flatten_value(rox_fields.get("summary")),
+                "rox_status": rox_status_name,
+                "rox_resolution": flatten_value(rox_fields.get("resolution")),
+                "rox_resolution_date": flatten_value(rox_fields.get("resolutiondate")),
+                "rox_fix_versions": flatten_value(rox_fields.get("fixVersions")),
+                "sfdc_case_ids": " | ".join(sfdc_ids) if sfdc_ids else "",
+                "sfdc_accounts": " | ".join(sfdc_accounts) if sfdc_accounts else "",
+                "cipoe_customers": " | ".join(customer_names) if customer_names else "",
+                "jira_rfe_url": f"{jira_url}/browse/{rfe_key}",
+                "jira_rox_url": f"{jira_url}/browse/{rox_key}",
+            })
+
+    print(f"  Processed {len(all_rfe_issues)} RFEs                    ")
+    print(f"  RFEs with ROX links: {rfe_with_links}")
+    print(f"  Mismatches found: {mismatches_found} (open RFE + closed ROX)")
 
     if output_path is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = Path(__file__).parent / f"rfe_rhacs_export_{timestamp}.csv"
+        output_path = Path(__file__).parent / f"rfe_rox_mismatch_{timestamp}.csv"
 
     if rows:
-        all_keys = list(rows[0].keys())
-        priority_cols = [
-            "key", "_sfdc_case_ids", "_sfdc_accounts",
-            "_cipoe_customers", "_rox_keys",
-        ]
-        for col in priority_cols:
-            if col in all_keys:
-                all_keys.remove(col)
-        all_keys = [c for c in priority_cols if c in rows[0]] + all_keys
-
+        fieldnames = list(rows[0].keys())
         with open(output_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=all_keys, extrasaction="ignore")
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(rows)
+    else:
+        output_path.write_text(
+            "rfe_key,rfe_summary,rfe_status,rox_key,rox_summary,rox_status,rox_resolution,rox_fix_versions\n",
+            encoding="utf-8",
+        )
 
     print(f"CSV saved: {output_path}")
     return output_path
@@ -465,7 +475,7 @@ def run_export(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Export RHACS Feature Requests (RFE) to CSV and upload to NotebookLM",
+        description="Report open RHACS RFEs whose linked ROX features are closed",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -478,16 +488,8 @@ def main():
         help=f"NotebookLM notebook name (default: {DEFAULT_NOTEBOOK_NAME})",
     )
     parser.add_argument(
-        "--force-all", action="store_true",
-        help="Export all open RHACS RFEs (ignore last-run state)",
-    )
-    parser.add_argument(
-        "--all-rfes", action="store_true",
-        help="Export ALL RHACS RFEs regardless of status or date",
-    )
-    parser.add_argument(
         "--output", "-o", type=Path, default=None,
-        help="Output CSV path (default: rfe_rhacs_export_YYYYMMDD_HHMMSS.csv)",
+        help="Output CSV path (default: rfe_rox_mismatch_YYYYMMDD_HHMMSS.csv)",
     )
     args = parser.parse_args()
 
@@ -508,19 +510,13 @@ def main():
     else:
         print("RH_OFFLINE_TOKEN not set - SFDC account names will not be resolved")
 
-    csv_path = run_export(
+    csv_path = run_report(
         jira_url=jira_url,
         api_token=token,
-        state_file=DEFAULT_STATE_FILE,
-        force_all=args.force_all,
-        all_rfes=args.all_rfes,
         output_path=args.output,
         rh_access_token=rh_access_token,
         jira_email=jira_email,
     )
-
-    if not args.force_all and not args.all_rfes:
-        save_last_run(DEFAULT_STATE_FILE, datetime.now().isoformat())
 
     if not args.skip_upload:
         if not notebooklm_upload_available():

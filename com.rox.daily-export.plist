@@ -7,10 +7,10 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>/Users/dcaspin/Projects/aifeaturepriortization/run_daily_export.sh</string>
+        <string>/path/to/aifeaturepriortization/run_daily_export.sh</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/Users/dcaspin/Projects/aifeaturepriortization</string>
+    <string>/path/to/aifeaturepriortization</string>
     <key>StartCalendarInterval</key>
     <dict>
         <key>Hour</key>
@@ -19,13 +19,13 @@
         <integer>0</integer>
     </dict>
     <key>StandardOutPath</key>
-    <string>/Users/dcaspin/Library/Logs/rox-daily-export.log</string>
+    <string>/path/to/your-home/Library/Logs/rox-daily-export.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/dcaspin/Library/Logs/rox-daily-export.err.log</string>
+    <string>/path/to/your-home/Library/Logs/rox-daily-export.err.log</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/usr/local/bin:/opt/homebrew/bin:/Users/dcaspin/.local/bin:/usr/bin:/bin</string>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
     </dict>
 </dict>
 </plist>

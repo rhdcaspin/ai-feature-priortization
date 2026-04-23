@@ -8,7 +8,7 @@ via related RFE feature requests).
 Uploads the CSV to Google NotebookLM.
 
 Usage:
-    export JIRA_TOKEN=your_token
+    export JIRA_TOKEN=your_token   # or JIRA_API_TOKEN
     python3 rox_feature_export_notebooklm.py
 
     # First run: exports features updated in last 30 days
@@ -17,7 +17,7 @@ Usage:
 Options:
     --skip-upload     Generate CSV only, skip NotebookLM upload
     --drive-folder-id Upload results to Google Drive folder (replaces file each run)
-    --notebook-name   Name of NotebookLM notebook (default: ROX Features Export)
+    --notebook-name   Name of NotebookLM notebook (default: The Big Notebook for RHACS Product Management)
     --force-all      Ignore last-run state; export open features only
     --all-features    Export ALL features (all statuses, no date filter)
 """
@@ -37,17 +37,13 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
 
-# Optional NotebookLM support
-try:
-    import asyncio
-    from notebooklm import NotebookLMClient
-    NOTEBOOKLM_AVAILABLE = True
-except ImportError:
-    NOTEBOOKLM_AVAILABLE = False
+from jira_auth import is_jira_cloud_url, jira_api_token_from_env  # noqa: E402
+from notebooklm_upload import notebooklm_upload_available, upload_csvs_to_notebook  # noqa: E402
 
 # State file to track last run timestamp
 DEFAULT_STATE_FILE = Path(__file__).parent / ".rox_export_last_run"
 DEFAULT_JIRA_URL = "https://issues.redhat.com"
+DEFAULT_NOTEBOOK_NAME = "The Big Notebook for RHACS Product Management"
 
 # Red Hat SSO / Hydra API for case account lookup
 RH_SSO_TOKEN_URL = "https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token"
@@ -120,6 +116,57 @@ DEFAULT_FIELD_IDS = [
     "customfield_12313240",   # Team
     "customfield_12313440",   # CIPOE (customer link)
 ]
+
+RICE_FIELD_CANDIDATES: Dict[str, List[str]] = {
+    "Reach": ["Reach"],
+    "Impact": ["Impact (migrated)", "Impact"],
+    "Confidence": ["Confidence"],
+    "Effort": ["Effort"],
+    "RICE Score": ["RICE Score", "Rice Score", "RICE score"],
+}
+
+# Column order for CSV (subset of keys); remaining keys keep discovery order after these.
+RICE_EXPORT_COLUMN_ORDER = ["Reach", "Impact", "Confidence", "Effort", "RICE Score"]
+
+
+def discover_rice_fields(
+    jira_url: str, session: requests.Session, api_version: str,
+) -> Dict[str, str]:
+    """Auto-discover RICE custom field IDs from Jira.
+
+    Returns mapping like ``{"Reach": "customfield_123", ...}``.
+    Missing fields map to ``""``.
+    """
+    try:
+        resp = session.get(f"{jira_url}/rest/api/{api_version}/field", timeout=15)
+        resp.raise_for_status()
+        all_fields = resp.json()
+    except Exception as e:
+        print(f"  Could not fetch Jira fields for RICE discovery: {e}")
+        return {k: "" for k in RICE_FIELD_CANDIDATES}
+
+    name_to_id: Dict[str, str] = {}
+    for f in all_fields:
+        if f.get("custom"):
+            name_to_id[f.get("name", "")] = f.get("id", "")
+
+    result: Dict[str, str] = {}
+    for col_name, candidates in RICE_FIELD_CANDIDATES.items():
+        fid = ""
+        for cand in candidates:
+            if cand in name_to_id:
+                fid = name_to_id[cand]
+                break
+        result[col_name] = fid
+
+    env_score = (os.getenv("JIRA_RICE_SCORE_FIELD") or "").strip()
+    if env_score:
+        result["RICE Score"] = env_score
+
+    found = {k: v for k, v in result.items() if v}
+    if found:
+        print(f"  RICE fields discovered: {', '.join(f'{k}={v}' for k, v in found.items())}")
+    return result
 
 
 
@@ -408,35 +455,39 @@ def run_export(
     all_features: bool,
     output_path: Optional[Path],
     rh_access_token: Optional[str] = None,
+    jira_email: Optional[str] = None,
 ) -> Path:
     """Export ROX features to CSV. Returns path to created CSV."""
     session = requests.Session()
     session.headers.update({
-        "Authorization": f"Bearer {api_token}",
         "Accept": "application/json",
         "Content-Type": "application/json",
     })
+    if is_jira_cloud_url(jira_url) and jira_email:
+        session.auth = (jira_email, api_token)
+    else:
+        session.headers["Authorization"] = f"Bearer {api_token}"
 
-    # Determine API version
-    api_version = "2"
-    for v in ("2", "3"):
-        try:
-            r = session.get(f"{jira_url}/rest/api/{v}/serverInfo", timeout=10)
-            if r.status_code == 200:
-                api_version = v
-                break
-        except Exception:
-            continue
+    is_cloud = is_jira_cloud_url(jira_url)
+    api_version = "3" if is_cloud else "2"
 
-    print(f"✅ Connected to Jira (API v{api_version})")
+    try:
+        r = session.get(f"{jira_url}/rest/api/{api_version}/serverInfo", timeout=10)
+        if r.status_code == 200:
+            print(f"✅ Connected to Jira (API v{api_version})")
+        else:
+            print(f"✅ Connected to Jira (API v{api_version}, serverInfo returned {r.status_code})")
+    except Exception:
+        print(f"✅ Connected to Jira (API v{api_version})")
+
+    rice_fields = discover_rice_fields(jira_url, session, api_version)
+    rice_id_to_col = {v: k for k, v in rice_fields.items() if v}
 
     # Build JQL
     if all_features:
-        # Export ALL features (all statuses, no date filter)
         jql = "project = ROX AND type = feature ORDER BY updated DESC"
         print("🔍 Exporting all ROX features (--all-features)")
     else:
-        # Default: only open features (Backlog, New, Refinement, To Do)
         status_filter = 'status in (Backlog, "New", Refinement, "To Do")'
         base_type_filter = "project = ROX AND type = feature AND " + status_filter
 
@@ -446,7 +497,6 @@ def run_export(
         else:
             last_run = load_last_run(state_file)
             if last_run:
-                # Jira expects format: "yyyy-MM-dd" or "yyyy/MM/dd"
                 try:
                     dt = datetime.fromisoformat(last_run.replace("Z", "+00:00"))
                     date_str = dt.strftime("%Y-%m-%d")
@@ -456,43 +506,57 @@ def run_export(
                     jql = f"{base_type_filter} ORDER BY updated DESC"
                     print("🔍 Exporting open ROX features (invalid state file)")
             else:
-                # First run: last 30 days
                 since = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
                 jql = f'{base_type_filter} AND updated >= "{since}" ORDER BY updated DESC'
                 print(f"🔍 First run: exporting open ROX features updated since {since}")
 
-    # Use curated field list (requesting all fields can cause 400 Bad Request)
-    fields_param = ",".join(DEFAULT_FIELD_IDS)
+    rice_extra = [fid for fid in rice_fields.values() if fid]
+    fields_param = ",".join(DEFAULT_FIELD_IDS + rice_extra)
 
-    # Fetch issues
     all_issues = []
-    start_at = 0
     max_results = 50
 
-    while True:
-        params = {
-            "jql": jql,
-            "startAt": start_at,
-            "maxResults": max_results,
-            "fields": fields_param,
-        }
-        resp = session.get(
-            f"{jira_url}/rest/api/{api_version}/search",
-            params=params,
-            timeout=60,
-        )
-        if resp.status_code != 200:
-            print(f"❌ Jira search failed: {resp.status_code}")
-            print(resp.text[:500])
-            sys.exit(1)
-
-        data = resp.json()
-        issues = data.get("issues", [])
-        all_issues.extend(issues)
-
-        if len(issues) < max_results:
-            break
-        start_at += max_results
+    if is_cloud:
+        search_url = f"{jira_url}/rest/api/3/search/jql"
+        next_token = None
+        while True:
+            params: dict = {
+                "jql": jql,
+                "maxResults": max_results,
+                "fields": fields_param,
+            }
+            if next_token:
+                params["nextPageToken"] = next_token
+            resp = session.get(search_url, params=params, timeout=60)
+            if resp.status_code != 200:
+                print(f"❌ Jira search failed: {resp.status_code}")
+                print(resp.text[:500])
+                sys.exit(1)
+            data = resp.json()
+            all_issues.extend(data.get("issues", []))
+            if data.get("isLast", True):
+                break
+            next_token = data.get("nextPageToken")
+            if not next_token:
+                break
+    else:
+        search_url = f"{jira_url}/rest/api/{api_version}/search"
+        start_at = 0
+        while True:
+            resp = session.get(search_url, params={
+                "jql": jql, "startAt": start_at,
+                "maxResults": max_results, "fields": fields_param,
+            }, timeout=60)
+            if resp.status_code != 200:
+                print(f"❌ Jira search failed: {resp.status_code}")
+                print(resp.text[:500])
+                sys.exit(1)
+            data = resp.json()
+            issues = data.get("issues", [])
+            all_issues.extend(issues)
+            if len(issues) < max_results:
+                break
+            start_at += max_results
 
     print(f"📊 Retrieved {len(all_issues)} features")
 
@@ -522,7 +586,8 @@ def run_export(
 
         row = {"key": issue_key}  # Ensure JIRA key is first
         for fid, fval in fields.items():
-            row[fid] = flatten_value(fval)
+            col = rice_id_to_col.get(fid, fid)
+            row[col] = flatten_value(fval)
 
         # SFDC case ID from custom fields and remote links
         row["_sfdc_case_id"] = extract_sfdc_case_ids(
@@ -596,7 +661,14 @@ def run_export(
         for col in priority_cols:
             if col in all_keys:
                 all_keys.remove(col)
-        all_keys = [c for c in priority_cols if c in rows[0]] + all_keys
+        rice_present = [c for c in RICE_EXPORT_COLUMN_ORDER if c in all_keys]
+        for col in rice_present:
+            all_keys.remove(col)
+        all_keys = (
+            [c for c in priority_cols if c in rows[0]]
+            + rice_present
+            + all_keys
+        )
 
         with open(output_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=all_keys, extrasaction="ignore")
@@ -605,36 +677,6 @@ def run_export(
 
     print(f"✅ CSV saved: {output_path}")
     return output_path
-
-
-async def upload_to_notebooklm(csv_path: Path, notebook_name: str) -> bool:
-    """Upload CSV file to NotebookLM. Returns True on success."""
-    if not NOTEBOOKLM_AVAILABLE:
-        print("❌ notebooklm-py not installed. Run: pip install 'notebooklm-py[browser]'")
-        return False
-
-    try:
-        async with await NotebookLMClient.from_storage() as client:
-            # Create or find notebook
-            notebooks = await client.notebooks.list()
-            nb = None
-            for n in notebooks:
-                if n.title == notebook_name:
-                    nb = n
-                    break
-            if nb is None:
-                nb = await client.notebooks.create(notebook_name)
-                print(f"📓 Created NotebookLM notebook: {notebook_name}")
-            else:
-                print(f"📓 Using existing NotebookLM notebook: {notebook_name}")
-
-            await client.sources.add_file(nb.id, str(csv_path), wait=True)
-            print(f"✅ Uploaded {csv_path.name} to NotebookLM")
-            return True
-    except Exception as e:
-        print(f"❌ NotebookLM upload failed: {e}")
-        print("   Ensure you have run 'notebooklm login' first")
-        return False
 
 
 def main():
@@ -650,8 +692,8 @@ def main():
     )
     parser.add_argument(
         "--notebook-name",
-        default="ROX Features Export",
-        help="NotebookLM notebook name (default: ROX Features Export)",
+        default=DEFAULT_NOTEBOOK_NAME,
+        help=f"NotebookLM notebook name (default: {DEFAULT_NOTEBOOK_NAME})",
     )
     parser.add_argument(
         "--force-all",
@@ -671,11 +713,13 @@ def main():
     )
     args = parser.parse_args()
 
-    token = os.getenv("JIRA_TOKEN")
+    token = jira_api_token_from_env()
     if not token:
-        print("❌ JIRA_TOKEN environment variable not set")
-        print("   Get a token from: https://issues.redhat.com/secure/ViewProfile.jspa?selectedTab=com.atlassian.pats.pats-plugin:jira-user-personal-access-tokens")
+        print("❌ JIRA_TOKEN or JIRA_API_TOKEN environment variable not set")
         sys.exit(1)
+
+    jira_url = os.getenv("JIRA_BASE_URL", DEFAULT_JIRA_URL)
+    jira_email = os.getenv("JIRA_EMAIL", "")
 
     # Red Hat Customer Portal API for SFDC account lookups
     rh_access_token = None
@@ -689,13 +733,14 @@ def main():
         print("   Get one from: https://access.redhat.com/management/api")
 
     csv_path = run_export(
-        jira_url=DEFAULT_JIRA_URL,
+        jira_url=jira_url,
         api_token=token,
         state_file=DEFAULT_STATE_FILE,
         force_all=args.force_all,
         all_features=args.all_features,
         output_path=args.output,
         rh_access_token=rh_access_token,
+        jira_email=jira_email,
     )
 
     # Save last run timestamp (unless force-all or all-features)
@@ -704,12 +749,13 @@ def main():
 
     # Upload to NotebookLM
     if not args.skip_upload:
-        if NOTEBOOKLM_AVAILABLE:
-            success = asyncio.run(upload_to_notebooklm(csv_path, args.notebook_name))
-            if not success:
-                sys.exit(1)
-        else:
-            print("❌ Install notebooklm-py for upload: pip install 'notebooklm-py[browser]'")
+        if not notebooklm_upload_available():
+            print(
+                "❌ NotebookLM upload unavailable: install notebooklm-mcp-cli and run `nlm login`, "
+                "or pip install 'notebooklm-py[browser]' and run `notebooklm login`"
+            )
+            sys.exit(1)
+        if not upload_csvs_to_notebook([csv_path], args.notebook_name):
             sys.exit(1)
     else:
         print("📤 Skipping NotebookLM upload (--skip-upload)")

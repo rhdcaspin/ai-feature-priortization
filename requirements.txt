@@ -1,8 +1,9 @@
 requests>=2.28.0
 python-dotenv>=1.0.0
 
-# Optional: for NotebookLM upload
-# pip install 'notebooklm-py[browser]' && notebooklm login
+# Optional: for NotebookLM upload (see notebooklm_upload.py)
+# Preferred (same auth as NLM MCP): pip install notebooklm-mcp-cli && nlm login
+# Fallback: pip install 'notebooklm-py[browser]' && notebooklm login
 
 # Optional: for rhacs_telemetry_export.py direct Snowflake queries
 # pip install snowflake-connector-python

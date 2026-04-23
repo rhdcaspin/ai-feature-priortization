@@ -5,20 +5,26 @@ RHACS Telemetry Export to CSV and NotebookLM
 Exports Red Hat Advanced Cluster Security (RHACS) customer telemetry data
 from the Dataverse (Snowflake) to CSV and uploads to Google NotebookLM.
 
-Data sources:
+Data sources (TELESENSE_DB.OPENSHIFT_MARTS):
   - OCP_USAGE_INDICATORS: Account-level health, risk/opportunity, version currency
   - OCP_OPR_LASTACTIVE: RHACS operator versions, clusters, cores, first/last active
   - OPENSHIFT_EBS_TYPE: Internal vs external account classification
 
+Data access — two paths (in priority order):
+  1. **Dataverse MCP** in Cursor: ask the agent to fetch both SQL queries via the
+     ``Dataverse-mcp-prod`` MCP server (``execute_sql``), save the results as JSON,
+     then run: ``python3 rhacs_telemetry_export.py --from-json indicators.json operator.json``
+  2. **Direct Snowflake**: ``pip install snowflake-connector-python`` + ``SNOWFLAKE_*`` env vars.
+
 Usage:
-    python3 rhacs_telemetry_export.py
-    python3 rhacs_telemetry_export.py --skip-upload
-    python3 rhacs_telemetry_export.py --from-json indicators.json operator.json
+    python3 rhacs_telemetry_export.py --from-json output/dataverse_indicators.json output/dataverse_operator.json
+    python3 rhacs_telemetry_export.py                  # direct Snowflake (needs connector + creds)
+    python3 rhacs_telemetry_export.py --skip-upload    # CSV only, no NotebookLM upload
 
 Options:
     --skip-upload     Generate CSV only, skip NotebookLM upload
     --notebook-name   NotebookLM notebook name
-    --from-json       Parse pre-fetched JSON files (indicators_file operator_file)
+    --from-json       Parse pre-fetched Dataverse MCP / Snowflake JSON files
     --output / -o     Output CSV path
 """
 
@@ -35,12 +41,7 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
 
-try:
-    import asyncio
-    from notebooklm import NotebookLMClient
-    NOTEBOOKLM_AVAILABLE = True
-except ImportError:
-    NOTEBOOKLM_AVAILABLE = False
+from notebooklm_upload import notebooklm_upload_available, upload_csvs_to_notebook  # noqa: E402
 
 try:
     import snowflake.connector
@@ -48,7 +49,7 @@ try:
 except ImportError:
     SNOWFLAKE_AVAILABLE = False
 
-DEFAULT_NOTEBOOK_NAME = "ACS RICE Scoring and Prioritization Framework"
+DEFAULT_NOTEBOOK_NAME = "The Big Notebook for RHACS Product Management"
 
 INDICATORS_SQL = """
 SELECT
@@ -89,9 +90,9 @@ SELECT
     ui.IS_ACS_OPR
 FROM TELESENSE_DB.OPENSHIFT_MARTS.OCP_USAGE_INDICATORS ui
 LEFT JOIN TELESENSE_DB.OPENSHIFT_MARTS.OPENSHIFT_EBS_TYPE ebs
-    ON ui.EBS_ACCOUNT = ebs."ebs_account"
+    ON ui.EBS_ACCOUNT = ebs.EBS_ACCOUNT
 WHERE ui.IS_ACS_OPR = 1
-  AND (ebs."status" IS NULL OR ebs."status" != 'Internal')
+  AND (ebs.STATUS IS NULL OR ebs.STATUS != 'Internal')
 ORDER BY ui.RECENT_1DAY_AVG_CORES DESC NULLS LAST
 """
 
@@ -110,9 +111,9 @@ SELECT
     la.DESC_OF_FAILURES AS RHACS_FAILURE_DESC
 FROM TELESENSE_DB.OPENSHIFT_MARTS.OCP_OPR_LASTACTIVE la
 LEFT JOIN TELESENSE_DB.OPENSHIFT_MARTS.OPENSHIFT_EBS_TYPE ebs
-    ON la.EBS_ACCOUNT_NUMBER = ebs."ebs_account"
+    ON la.EBS_ACCOUNT_NUMBER = ebs.EBS_ACCOUNT
 WHERE la.OPERATOR_NAME = 'rhacs-operator'
-  AND (ebs."status" IS NULL OR ebs."status" != 'Internal')
+  AND (ebs.STATUS IS NULL OR ebs.STATUS != 'Internal')
 ORDER BY la.EBS_ACCOUNT_NUMBER, la.OPR_VER_LAST_ACTIVE DESC
 """
 
@@ -137,6 +138,8 @@ def load_mcp_json(filepath: str) -> tuple[list[str], list[dict]]:
     columns = data.get("columns", [])
     rows = data.get("data", [])
     return columns, rows
+
+
 
 
 def aggregate_operator_data(operator_rows: list[dict]) -> Dict[str, dict]:
@@ -311,35 +314,6 @@ def write_csv(rows: list[dict], output_path: Path) -> Path:
     return output_path
 
 
-async def upload_to_notebooklm(csv_path: Path, notebook_name: str) -> bool:
-    """Upload CSV file to NotebookLM. Returns True on success."""
-    if not NOTEBOOKLM_AVAILABLE:
-        print("notebooklm-py not installed. Run: pip install 'notebooklm-py[browser]'")
-        return False
-
-    try:
-        async with await NotebookLMClient.from_storage() as client:
-            notebooks = await client.notebooks.list()
-            nb = None
-            for n in notebooks:
-                if n.title == notebook_name:
-                    nb = n
-                    break
-            if nb is None:
-                nb = await client.notebooks.create(notebook_name)
-                print(f"Created NotebookLM notebook: {notebook_name}")
-            else:
-                print(f"Using existing NotebookLM notebook: {notebook_name}")
-
-            await client.sources.add_file(nb.id, str(csv_path), wait=True)
-            print(f"Uploaded {csv_path.name} to NotebookLM")
-            return True
-    except Exception as e:
-        print(f"NotebookLM upload failed: {e}")
-        print("   Ensure you have run 'notebooklm login' first")
-        return False
-
-
 def run_from_snowflake(conn_params: dict) -> tuple[list[dict], list[dict]]:
     """Fetch both datasets from Snowflake."""
     print("Querying Snowflake for RHACS usage indicators...")
@@ -418,9 +392,10 @@ def main():
         }
         ind_rows, opr_rows = run_from_snowflake(conn_params)
     else:
-        print("No data source available.")
-        print("Either install snowflake-connector-python and set credentials,")
-        print("or use --from-json with pre-fetched MCP JSON files.")
+        print("No data source available. Two options:")
+        print("  1. In Cursor: fetch both queries via Dataverse MCP (execute_sql),")
+        print("     save the JSON output, then: --from-json indicators.json operator.json")
+        print("  2. pip install snowflake-connector-python + set SNOWFLAKE_* in .env")
         sys.exit(1)
 
     operator_agg = aggregate_operator_data(opr_rows)
@@ -432,12 +407,13 @@ def main():
     print(f"Wrote {len(csv_rows)} accounts to {output_path}")
 
     if not args.skip_upload:
-        if NOTEBOOKLM_AVAILABLE:
-            success = asyncio.run(upload_to_notebooklm(output_path, args.notebook_name))
-            if not success:
-                sys.exit(1)
-        else:
-            print("Install notebooklm-py for upload: pip install 'notebooklm-py[browser]'")
+        if not notebooklm_upload_available():
+            print(
+                "NotebookLM upload unavailable: install notebooklm-mcp-cli and run `nlm login`, "
+                "or pip install 'notebooklm-py[browser]' and run `notebooklm login`"
+            )
+            sys.exit(1)
+        if not upload_csvs_to_notebook([output_path], args.notebook_name):
             sys.exit(1)
     else:
         print("Skipping NotebookLM upload (--skip-upload)")
