@@ -8,6 +8,7 @@ This repository validates **ROX** Jira **Features** against the product descript
 |------|--------|----------------|
 | Compliance CSV + optional Google Sheets for a **Target Version** | `jira_feature_validator.py` | [docs/scripts/jira_feature_validator.md](docs/scripts/jira_feature_validator.md) |
 | Version labels on issues, PM gap report, same compliance columns, optional **NotebookLM RICE** | `rox_target_version_labels_pm_validation.py` | [docs/scripts/rox_target_version_labels_pm_validation.md](docs/scripts/rox_target_version_labels_pm_validation.md) |
+| **Rank** backlog order from **RICE Score** (respects manual rank overrides) | `rox_rice_rank_sync.py` | [docs/scripts/rox_rice_rank_sync.md](docs/scripts/rox_rice_rank_sync.md) |
 
 ## Quick start
 

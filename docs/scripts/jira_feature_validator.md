@@ -2,7 +2,7 @@
 
 ## Role
 
-Connects to Jira, loads **ROX** issues of type **Feature** for a given **Target Version**, and checks that the description follows the expected product template (Goal Summary, Goals/outcomes, Acceptance Criteria, Success criteria, optional sections). Produces a timestamped **compliance CSV** under `output/`. Optionally uploads that CSV to **Google Sheets** via a `gcloud` access token.
+Connects to Jira, loads **ROX** issues of type **Feature** for a given **Target Version**, and checks that the description follows the expected product template (Goal Summary, Goals/outcomes, Acceptance Criteria, Success criteria, optional sections). Produces a timestamped **compliance CSV** under `output/`. Optionally uploads that CSV to **Google Sheets** via a `gcloud` access token. On upload, the **Key** column becomes a clickable **HYPERLINK** to `{JIRA_BASE_URL}/browse/<KEY>` (default base `https://redhat.atlassian.net` if unset).
 
 Issues in Jira’s **Done** status category (for example Closed) are **not** fetched, so completed features are excluded from validation.
 

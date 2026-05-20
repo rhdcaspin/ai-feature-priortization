@@ -474,8 +474,10 @@ def main():
         help="Generate CSV only, skip NotebookLM upload",
     )
     parser.add_argument(
-        "--notebook-name", default=DEFAULT_NOTEBOOK_NAME,
-        help=f"NotebookLM notebook name (default: {DEFAULT_NOTEBOOK_NAME})",
+        "--notebook-name",
+        default=os.getenv("NOTEBOOKLM_NOTEBOOK_NAME", DEFAULT_NOTEBOOK_NAME),
+        help="NotebookLM notebook name (default: NOTEBOOKLM_NOTEBOOK_NAME or "
+        f"{DEFAULT_NOTEBOOK_NAME!r})",
     )
     parser.add_argument(
         "--force-all", action="store_true",

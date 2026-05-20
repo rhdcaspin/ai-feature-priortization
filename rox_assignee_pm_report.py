@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-Export ROX issues where Assignee OR Product Manager matches a person and status is not Done/Closed.
+Export ROX issues where Assignee OR Product Manager (and optionally Reporter) matches a person
+and status is not Done/Closed.
 
 Uses JIRA_TOKEN (or JIRA_API_TOKEN) / JIRA_BASE_URL / JIRA_EMAIL from .env (same as jira_feature_validator.py).
-Resolves the person via Jira user search (display name), then runs two JQL queries and merges
-(OR semantics) so JQL user-picker quirks are avoided.
+Resolves the person via Jira user search (display name), then runs JQL queries and merges
+(OR semantics) so JQL user-picker quirks are avoided. Multiple Jira accounts with the same
+display name (e.g. two \"Anjali Telang\" users) are all included.
 
 Usage:
     python3 rox_assignee_pm_report.py --name "Anjali Talang"
     python3 rox_assignee_pm_report.py --name "Anjali Talang" -o report.csv
     python3 rox_assignee_pm_report.py --account-id "557058:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+    python3 rox_assignee_pm_report.py --name "Anjali Telang" --include-reporter \\
+        --google-sheet-title "ROX open - Anjali Telang"
 """
 
 from __future__ import annotations
@@ -29,7 +33,11 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 
 from jira_auth import is_jira_cloud_url, jira_api_token_from_env  # noqa: E402
-from jira_feature_validator import JiraFeatureValidator  # noqa: E402
+from jira_feature_validator import (  # noqa: E402
+    JiraFeatureValidator,
+    _get_gcloud_access_token,
+    upload_csv_to_google_sheet,
+)
 
 
 def _norm(s: str) -> str:
@@ -87,31 +95,40 @@ def _names_match(wanted: str, display: str) -> bool:
     return False
 
 
-def pick_account_id(
+def resolve_account_ids(
     users: List[Dict[str, Any]],
     wanted_name: str,
-) -> Optional[str]:
-    """Pick accountId matching display name (case-insensitive, light typo fold)."""
+) -> Optional[List[str]]:
+    """Resolve one or more accountIds matching display name (case-insensitive, Talang/Telang fold)."""
     if not users:
         return None
     matches = [
         u for u in users
         if _names_match(wanted_name, _display_name(u))
     ]
-    if len(matches) == 1:
-        return matches[0].get("accountId") or matches[0].get("name")
-    if len(matches) > 1:
-        print(
-            "❌ Several Jira users match that name (after normalizing Talang/Telang). "
-            "Pick one --account-id:"
-        )
-        for u in matches:
-            print(f"   {_display_name(u)!r}  accountId={u.get('accountId')!r}")
+    if not matches:
         return None
-    if len(users) == 1 and _names_match(wanted_name, _display_name(users[0])):
-        u = users[0]
-        return u.get("accountId") or u.get("name")
+    if len(matches) == 1:
+        uid = matches[0].get("accountId") or matches[0].get("name")
+        return [uid] if uid else None
+    # Same person may have multiple Atlassian accounts with identical displayName
+    norm_names = {_norm(_display_name(u)) for u in matches}
+    if len(norm_names) == 1:
+        ids = [u.get("accountId") for u in matches if u.get("accountId")]
+        return ids or None
+    print(
+        "❌ Several Jira users match that name with different display names. "
+        "Pick one --account-id:"
+    )
+    for u in matches:
+        print(f"   {_display_name(u)!r}  accountId={u.get('accountId')!r}")
     return None
+
+
+def jql_user_in(field: str, account_ids: List[str]) -> str:
+    """JQL fragment: field in (\"id1\", \"id2\") for user fields."""
+    inner = ", ".join(jql_quoted_user(uid) for uid in account_ids if uid)
+    return f"{field} in ({inner})" if inner else ""
 
 
 def jira_search_all(
@@ -195,6 +212,7 @@ def issue_to_row(
     st = (fields.get("status") or {}).get("name", "")
     itype = (fields.get("issuetype") or {}).get("name", "")
     summ = fields.get("summary") or ""
+    reporter = _display_name(fields.get("reporter"))
     assignee = _display_name(fields.get("assignee"))
     pm = _display_name(fields.get(pm_field))
     tv = _flatten_target_version(fields, tv_field_id)
@@ -209,6 +227,7 @@ def issue_to_row(
         "Summary": summ,
         "Status": st,
         "Issue Type": itype,
+        "Reporter": reporter,
         "Assignee": assignee,
         "Product Manager": pm,
         "Target Version": tv,
@@ -219,9 +238,38 @@ def issue_to_row(
     }
 
 
+def create_google_spreadsheet(title: str) -> Optional[tuple[str, str]]:
+    """Create a new spreadsheet; returns (spreadsheet_id, spreadsheetUrl) or None."""
+    token = _get_gcloud_access_token()
+    if not token:
+        print(
+            "⚠️  Could not get gcloud access token.\n"
+            "   Run: gcloud auth login --enable-gdrive-access"
+        )
+        return None
+    r = requests.post(
+        "https://sheets.googleapis.com/v4/spreadsheets",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        json={"properties": {"title": (title or "Jira export")[:100]}},
+        timeout=60,
+    )
+    if r.status_code != 200:
+        print(f"⚠️  Create spreadsheet failed: {r.status_code} {r.text[:300]}")
+        return None
+    data = r.json()
+    sid = data.get("spreadsheetId")
+    surl = data.get("spreadsheetUrl") or ""
+    if not sid:
+        return None
+    return sid, surl
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="ROX report: Assignee OR Product Manager = person, not Done status",
+        description="ROX report: Assignee OR Product Manager (= person), optional Reporter, not Done",
     )
     parser.add_argument(
         "--name",
@@ -231,7 +279,33 @@ def main() -> int:
     parser.add_argument(
         "--account-id",
         default="",
-        help="Jira accountId (skips user search if set)",
+        help="Jira accountId(s), comma-separated (skips user search if set)",
+    )
+    parser.add_argument(
+        "--include-reporter",
+        action="store_true",
+        help="Also include issues where the person is Reporter (creator)",
+    )
+    parser.add_argument(
+        "--google-sheet-title",
+        default="",
+        metavar="TITLE",
+        help="Create a new Google Sheet with this title and upload the CSV (Sheet1)",
+    )
+    parser.add_argument(
+        "--update-sheet",
+        action="store_true",
+        help="Upload CSV to an existing spreadsheet (needs --sheet-id and --sheet-name)",
+    )
+    parser.add_argument(
+        "--sheet-id",
+        default=os.getenv("GOOGLE_SHEET_ID", ""),
+        help="Spreadsheet ID for --update-sheet (default: GOOGLE_SHEET_ID)",
+    )
+    parser.add_argument(
+        "--sheet-name",
+        default=os.getenv("GOOGLE_SHEET_NAME", "Sheet1"),
+        help='Tab name for --update-sheet (default: GOOGLE_SHEET_NAME or "Sheet1")',
     )
     parser.add_argument(
         "--project",
@@ -275,38 +349,44 @@ def main() -> int:
     if not tv_field:
         tv_field = "customfield_10855" if is_jira_cloud_url(jira_url) else "customfield_12319940"
 
-    account_id = (args.account_id or "").strip()
-    if not account_id:
+    raw_id = (args.account_id or "").strip()
+    if raw_id:
+        account_ids = [x.strip() for x in raw_id.split(",") if x.strip()]
+        if not account_ids:
+            print("❌ --account-id was empty")
+            return 1
+        print(f"✅ Using --account-id: {account_ids!r}")
+    else:
         users = search_users(v.session, jira_url, api_version, args.name)
         if not users:
             print(f'❌ No users found for query "{args.name}". Try --account-id from Jira profile.')
             return 1
-        account_id = pick_account_id(users, args.name)
-        if not account_id:
-            print("❌ Could not pick a unique user. Candidates from search (use --account-id):")
+        resolved = resolve_account_ids(users, args.name)
+        if not resolved:
+            print("❌ Could not resolve user. Candidates from search (use --account-id):")
             for u in users[:20]:
                 print(f"   {_display_name(u)!r}  accountId={u.get('accountId')!r}")
             return 1
-        print(f"✅ Using account: {account_id!r} (search name: {args.name!r})")
-    else:
-        print(f"✅ Using --account-id: {account_id!r}")
+        account_ids = resolved
+        print(f"✅ Using account(s): {account_ids!r} (search name: {args.name!r})")
 
     # Not in Closed / not Done: status category excludes completed work
     status_filter = "statusCategory != Done"
     fields_param = (
-        f"summary,status,assignee,issuetype,labels,created,updated,{pm_field},{tv_field}"
+        f"summary,status,reporter,assignee,issuetype,labels,created,updated,"
+        f"{pm_field},{tv_field}"
     )
 
     pm_jql_name = os.getenv("JIRA_PRODUCT_MANAGER_JQL", "Product Manager").strip() or "Product Manager"
 
-    jql_uid = jql_quoted_user(account_id)
-
     jql_assignee = (
-        f"project = {args.project} AND {status_filter} AND assignee = {jql_uid}"
+        f"project = {args.project} AND {status_filter} AND "
+        f"{jql_user_in('assignee', account_ids)}"
     )
+    inner_pm = ", ".join(jql_quoted_user(uid) for uid in account_ids)
     jql_pm = (
         f'project = {args.project} AND {status_filter} '
-        f'AND "{pm_jql_name}" = {jql_uid}'
+        f'AND "{pm_jql_name}" in ({inner_pm})'
     )
 
     print(f"🔍 Query A (assignee): {jql_assignee}")
@@ -321,8 +401,21 @@ def main() -> int:
     )
     print(f"   → {len(issues_b)} issues")
 
+    merged: List[Dict] = list(issues_a) + list(issues_b)
+    if args.include_reporter:
+        jql_reporter = (
+            f"project = {args.project} AND {status_filter} AND "
+            f"{jql_user_in('reporter', account_ids)}"
+        )
+        print(f"🔍 Query C (reporter): {jql_reporter}")
+        issues_c = jira_search_all(
+            v.session, jira_url, is_cloud, api_version, jql_reporter, fields_param,
+        )
+        print(f"   → {len(issues_c)} issues")
+        merged.extend(issues_c)
+
     by_key: Dict[str, Dict] = {}
-    for issue in issues_a + issues_b:
+    for issue in merged:
         k = issue.get("key")
         if k:
             by_key[k] = issue
@@ -347,6 +440,7 @@ def main() -> int:
         "Summary",
         "Status",
         "Issue Type",
+        "Reporter",
         "Assignee",
         "Product Manager",
         "Target Version",
@@ -361,6 +455,37 @@ def main() -> int:
         w.writerows(rows)
 
     print(f"\n📄 Report: {out_path}  ({len(rows)} issues)")
+
+    title = (args.google_sheet_title or "").strip()
+    if title:
+        created = create_google_spreadsheet(title)
+        if not created:
+            return 1
+        sid, surl = created
+        print(f"📤 New spreadsheet: {surl}")
+        ok = upload_csv_to_google_sheet(
+            str(out_path),
+            sid,
+            "Sheet1",
+            jira_base_url=jira_url.rstrip("/"),
+        )
+        return 0 if ok else 1
+
+    if args.update_sheet:
+        sid = (args.sheet_id or "").strip()
+        if not sid:
+            print("❌ --update-sheet requires --sheet-id or GOOGLE_SHEET_ID")
+            return 1
+        tab = (args.sheet_name or "Sheet1").strip() or "Sheet1"
+        print(f"\n📤 Uploading to Google Sheets tab {tab!r}…")
+        ok = upload_csv_to_google_sheet(
+            str(out_path),
+            sid,
+            tab,
+            jira_base_url=jira_url.rstrip("/"),
+        )
+        return 0 if ok else 1
+
     return 0
 
 

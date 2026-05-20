@@ -6,14 +6,15 @@ Categories (mutually exclusive pillars):
   - unified-workload-protection
   - frictionless-security-runtime-observability
   - ai-driven-vuln-risk-management
+  - enterprise-scalability-support (enterprise scale, reliability, HA/DR, performance, supportability)
 
 Additionally, each issue may get the **enterprise_ready** label (independent of pillar):
 true when the text describes GA / production / broad enterprise deployment readiness; false otherwise.
+This is separate from the **enterprise-scalability-support** pillar slug.
 
-For each issue: AI picks one pillar category. If that label is missing, it is added.
-If another pillar label from the set is already present and differs from the AI choice,
-the old pillar label(s) are removed so only one pillar remains (use --additive-only
-to never remove existing pillar labels).
+For each issue: AI picks one pillar category. Jira is always updated so **at most one**
+pillar label from the set is present: any other pillar labels from the set are removed when they
+differ from the AI choice.
 
 After batch + single-issue JSON retries, small local models get an extra pass
 without ``format=json``, then a **plain-line** answer (no JSON). Disable with
@@ -54,6 +55,7 @@ PILLAR_LABELS = (
     "unified-workload-protection",
     "frictionless-security-runtime-observability",
     "ai-driven-vuln-risk-management",
+    "enterprise-scalability-support",
 )
 
 ENTERPRISE_READY_LABEL = "enterprise_ready"
@@ -64,6 +66,8 @@ For each feature, also set boolean "enterprise_ready":
          customer production use, or clearly not experimental/preview-only.
   false — preview/tech-preview/experimental, narrow/internal use, insufficient description,
          or clearly not positioned as broadly enterprise-deployable.
+
+Do not confuse this boolean with the pillar slug ``enterprise-scalability-support`` (category field).
 """
 
 PILLAR_GUIDANCE = """
@@ -80,17 +84,73 @@ Classify each Red Hat Advanced Cluster Security (ACS / RHACS) **Feature** into e
    observability, metrics/logging/tracing for security workflows, reducing friction in install
    upgrade and day-2 ops, roxctl/CLI ergonomics, UI flows that are about using the product
    smoothly, performance and reliability of the control plane / sensor path when framed as
-   "making security usable and visible", not vuln-specific.
+   "making security usable and visible", not vuln-specific and not primarily about fleet scale,
+   HA/DR, or enterprise sizing limits.
 
 3) ai-driven-vuln-risk-management
    Vulnerability management, image/registry scanning, risk scoring and prioritization,
    SBOM, CVE workflows, remediation guidance, AI/ML applied to vuln or risk data,
    scanner integration, deferral/exceptions for CVEs.
 
+4) enterprise-scalability-support
+   Enterprise scalability, reliability, and supportability: HA/DR and continuity,
+   backup/restore, scaling Central/Sensor/Scanner for large fleets or high cardinality,
+   performance under load, resource sizing and limits, operator lifecycle at scale,
+   init-bundle / certificate rotation at scale, running without optional components to save
+   resources, multi-cluster posture, support diagnostics and production-grade operations when
+   the **primary** outcome is operating ACS reliably at enterprise scale (not workload policy,
+   not vuln prioritization, not general UX polish unless the story is scale or supportability).
+
 If two pillars seem to apply, pick the **primary** customer outcome described in the text.
+Never return more than one pillar slug in ``category`` (a single string, not a list).
 Return ONLY valid JSON: an array of objects
-{"key": "<ROX-nnnn>", "category": "<one of the three pillar slugs>", "enterprise_ready": true|false}.
+{"key": "<ROX-nnnn>", "category": "<one of the four pillar slugs>", "enterprise_ready": true|false}.
 """
+
+
+def _coerce_single_pillar_category(raw: Any) -> str:
+    """Normalize LLM ``category`` to exactly one pillar slug, or \"\" if none."""
+    if raw is None:
+        return ""
+    if isinstance(raw, list):
+        for item in raw:
+            v = _coerce_single_pillar_category(item)
+            if v:
+                return v
+        return ""
+    s = str(raw).strip()
+    if not s:
+        return ""
+    low = s.lower().replace("_", "-")
+    # Shorthand / legacy names for the scalability pillar (distinct from boolean enterprise_ready in JSON)
+    if low in (
+        "enterprise-ready",
+        "enterprise-ready-scalability-support",
+        "scalability-support",
+        "scalability-enterprise-support",
+        "scalability-and-support",
+        "enterprise-scalability",
+        "enterprise-support",
+    ):
+        return "enterprise-scalability-support"
+    if s in PILLAR_LABELS:
+        return s
+    if low in PILLAR_LABELS:
+        return low
+    for part in re.split(r"[,|;]+", s):
+        t = part.strip().lower().replace(" ", "-").replace("_", "-")
+        if t in (
+            "enterprise-ready",
+            "scalability-support",
+            "enterprise-scalability-support",
+        ):
+            return "enterprise-scalability-support"
+        if t in PILLAR_LABELS:
+            return t
+    for slug in sorted(PILLAR_LABELS, key=len, reverse=True):
+        if slug in low:
+            return slug
+    return ""
 
 
 def _parse_enterprise_ready_flag(raw: Any) -> Optional[bool]:
@@ -122,7 +182,7 @@ def _rows_from_classification_list(rows: List[Any]) -> Dict[str, Dict[str, Any]]
         if not isinstance(row, dict):
             continue
         k = (row.get("key") or row.get("Key") or row.get("issue") or row.get("id") or "").strip()
-        c = (
+        raw_cat = (
             row.get("category")
             or row.get("Category")
             or row.get("label")
@@ -132,12 +192,9 @@ def _rows_from_classification_list(rows: List[Any]) -> Dict[str, Dict[str, Any]]
             or row.get("theme")
             or ""
         )
-        if isinstance(c, str):
-            c = c.strip()
-        else:
-            c = str(c).strip() if c is not None else ""
+        c = _coerce_single_pillar_category(raw_cat)
         er = _parse_enterprise_ready_flag(row.get("enterprise_ready"))
-        if k and c in PILLAR_LABELS:
+        if k and c:
             out[k.upper()] = {"category": c, "enterprise_ready": er}
     return out
 
@@ -156,15 +213,20 @@ def _extract_classification_rows(parsed: Any) -> List[dict]:
             isinstance(k, str) and re.match(r"^ROX-\d+$", k.strip(), re.I)
             for k in parsed.keys()
         )
-        vals_ok = all(isinstance(v, str) and v.strip() in PILLAR_LABELS for v in parsed.values())
+        vals_ok = all(isinstance(v, str) and _coerce_single_pillar_category(v) for v in parsed.values())
         if keys_ok and vals_ok:
-            return [{"key": k, "category": v.strip(), "enterprise_ready": None} for k, v in parsed.items()]
+            return [
+                {"key": k, "category": _coerce_single_pillar_category(v), "enterprise_ready": None}
+                for k, v in parsed.items()
+            ]
 
     # Single object: {"key":"ROX-1","category":"..."} (or typo keys)
     k0 = (parsed.get("key") or parsed.get("Key") or "").strip()
-    c0 = (parsed.get("category") or parsed.get("Category") or "").strip()
+    c0 = _coerce_single_pillar_category(parsed.get("category") or parsed.get("Category"))
     if k0 and c0 and re.match(r"^ROX-\d+$", k0, re.I):
-        return [parsed]
+        one = dict(parsed)
+        one["category"] = c0
+        return [one]
 
     for name in ("classification", "result", "entry", "feature"):
         v = parsed.get(name)
@@ -338,7 +400,7 @@ def _ollama_classify_batch(
         "You are a product taxonomy assistant for RHACS. "
         + PILLAR_GUIDANCE
         + ENTERPRISE_READY_GUIDANCE
-        + "\nThe three allowed category values are exactly:\n"
+        + "\nThe four allowed category values are exactly:\n"
         + "\n".join(f"  - {p}" for p in PILLAR_LABELS)
     )
     user_msg = (
@@ -494,22 +556,14 @@ def fetch_features_jql(
 def compute_label_updates(
     desired: str,
     current: List[str],
-    additive_only: bool,
 ) -> Tuple[str, List[Dict[str, str]]]:
-    """Return (status, updates) where status is already_correct | skip | would_update."""
-    current_set = set(current)
+    """Return (status, updates). Always enforces exactly one pillar label: removes any other pillar from the set."""
+    current_set = set(str(x) for x in (current or []))
     pillars_on = [p for p in PILLAR_LABELS if p in current_set]
     wrong = [p for p in pillars_on if p != desired]
 
     if not wrong and desired in current_set:
         return "already_correct", []
-
-    if additive_only:
-        if pillars_on and desired not in current_set:
-            return "skip_other_pillar_present", []
-        if desired in current_set:
-            return "already_correct", []
-        return "would_update", [{"add": desired}]
 
     updates: List[Dict[str, str]] = []
     for p in PILLAR_LABELS:
@@ -544,18 +598,17 @@ def _lookup_classification(
     ku = issue_key.upper().strip()
     row = mapped.get(ku)
     if isinstance(row, dict) and row.get("category"):
-        c = str(row["category"]).strip()
-        if c in PILLAR_LABELS:
+        c = _coerce_single_pillar_category(row.get("category"))
+        if c:
             return (c, _parse_enterprise_ready_flag(row.get("enterprise_ready")))
     for mk, row in mapped.items():
         if not mk or not row:
             continue
         if not isinstance(row, dict):
             continue
-        c = row.get("category")
-        if not c or str(c).strip() not in PILLAR_LABELS:
+        c = _coerce_single_pillar_category(row.get("category"))
+        if not c:
             continue
-        c = str(c).strip()
         mku = str(mk).upper().strip()
         if mku == ku or (mku.isdigit() and ku == f"ROX-{mku}"):
             return (c, _parse_enterprise_ready_flag(row.get("enterprise_ready")))
@@ -622,11 +675,6 @@ def main() -> int:
         "--no-plain-fallback",
         action="store_true",
         help="Do not use single-line (non-JSON) LLM fallback after JSON retries fail",
-    )
-    parser.add_argument(
-        "--additive-only",
-        action="store_true",
-        help="Only add missing pillar label; do not remove other pillar labels",
     )
     parser.add_argument(
         "--ollama-url",
@@ -794,7 +842,7 @@ def main() -> int:
             continue
         labels = f["labels"]
         er_desired: Optional[bool] = key_to_enterprise_ready.get(key)
-        status, pillar_updates = compute_label_updates(desired, labels, args.additive_only)
+        status, pillar_updates = compute_label_updates(desired, labels)
         er_updates = enterprise_ready_label_updates(er_desired, labels)
         updates = pillar_updates + er_updates
         pillars = [p for p in PILLAR_LABELS if p in labels]
@@ -804,14 +852,6 @@ def main() -> int:
             print(f"   ✓ {key}: {desired} (already correct)")
             skipped += 1
             continue
-        if status == "skip_other_pillar_present" and not er_updates:
-            print(
-                f"   — {key}: AI→{desired} skipped (--additive-only; "
-                f"already has {pillars})"
-            )
-            skipped += 1
-            continue
-
         if not updates:
             skipped += 1
             continue

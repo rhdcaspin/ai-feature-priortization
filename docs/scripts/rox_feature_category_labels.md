@@ -23,6 +23,6 @@ python3 rox_feature_category_labels.py --apply --ollama-model mistral
 python3 rox_feature_category_labels.py --apply --jql 'project = ROX AND type = feature AND "Target Version" = "5.0.0"'
 ```
 
-Use `--additive-only` to only add a missing pillar label without removing conflicting pillar labels. Plain-line fallback does **not** set `enterprise_ready`; JSON paths should include `enterprise_ready` when you want that label synced.
+Exactly **one** pillar label is enforced on each issue: any other pillar from the set is removed when it differs from the model’s choice. If the model returns a compound value (for example two slugs separated by `|`), the script keeps the first recognizable slug. Plain-line fallback does **not** set `enterprise_ready`; JSON paths should include `enterprise_ready` when you want that label synced.
 
 Run `python3 rox_feature_category_labels.py --help` for batch size, delays, and retry flags.

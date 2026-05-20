@@ -10,8 +10,9 @@ For all ROX Features with a given Target Version (default 5.0.0):
 
 Uses JIRA_TOKEN (or JIRA_API_TOKEN) / JIRA_BASE_URL / JIRA_EMAIL from .env (same as jira_feature_validator.py).
 NotebookLM RICE: prefers **nlm** (``pip install notebooklm-mcp-cli`` + ``nlm login``); else **notebooklm-py**
-(``pip install 'notebooklm-py[browser]'`` + ``notebooklm login``). By default RICE prompts list **only Jira keys**
-so NotebookLM uses your uploaded sources; pass ``--rice-jira-context`` to embed summary/description again.
+(``pip install 'notebooklm-py[browser]'`` + ``notebooklm login``). By default each line is **key + Jira summary**
+(so issues missing from uploaded sources—e.g. new ROX tickets—still have context). Use ``NOTEBOOKLM_RICE_SUMMARY_MAX=0``
+for keys-only prompts. Pass ``--rice-jira-context`` to also embed description excerpts from Jira.
 
 Usage:
     python3 rox_target_version_labels_pm_validation.py
@@ -123,6 +124,23 @@ def _normalize_rice_row(obj: Any) -> Optional[Tuple[str, Dict[str, str]]]:
     return key, out
 
 
+def _rice_summary_max_keys_mode() -> int:
+    """Max chars of Jira summary per issue when not using full ``--rice-jira-context``. 0 = omit summaries."""
+    raw = (os.getenv("NOTEBOOKLM_RICE_SUMMARY_MAX") or "500").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 500
+
+
+def _rice_summary_line(feat: Dict, max_chars: int) -> str:
+    s = ((feat.get("fields") or {}).get("summary") or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    if max_chars > 0 and len(s) > max_chars:
+        s = s[: max_chars - 3] + "..."
+    return s
+
+
 def _build_rice_batch_prompt(
     batch: List[Dict],
     validator: JiraFeatureValidator,
@@ -138,15 +156,27 @@ def _build_rice_batch_prompt(
         f"These are ROX Jira **Features** with Target Version **{target_version}**.",
         "",
     ]
+    sum_max = _rice_summary_max_keys_mode() if keys_only else 0
     if keys_only:
-        lines.extend([
-            "Below are **only Jira issue keys**. Use **this notebook's uploaded sources** to "
-            "find each feature's full context (summary, description, etc.) by key.",
-            "",
-            "For EACH key, assign integer scores **exactly as your framework defines** for "
-            "Reach, Impact, Confidence, and Effort (same scales and meanings as in the notebook).",
-            "",
-        ])
+        if sum_max > 0:
+            lines.extend([
+                "Below each line is **Jira issue key — summary** (summary is copied from Jira for this request).",
+                "Use **this notebook's uploaded sources** for the RICE framework and for **extra** context when a key "
+                "also appears there; if a key is missing from sources, rely on the inline summary.",
+                "",
+                "For EACH feature, assign integer scores **exactly as your framework defines** for "
+                "Reach, Impact, Confidence, and Effort (same scales and meanings as in the notebook).",
+                "",
+            ])
+        else:
+            lines.extend([
+                "Below are **only Jira issue keys**. Use **this notebook's uploaded sources** to "
+                "find each feature's full context (summary, description, etc.) by key.",
+                "",
+                "For EACH key, assign integer scores **exactly as your framework defines** for "
+                "Reach, Impact, Confidence, and Effort (same scales and meanings as in the notebook).",
+                "",
+            ])
     else:
         lines.extend([
             "For EACH feature below, assign integer scores **exactly as your framework defines** "
@@ -164,7 +194,11 @@ def _build_rice_batch_prompt(
     for i, feat in enumerate(batch, 1):
         k = feat.get("key", "")
         if keys_only:
-            lines.append(f"{i}. {k}")
+            if sum_max > 0:
+                summ = _rice_summary_line(feat, sum_max)
+                lines.append(f"{i}. {k} — {summ}" if summ else f"{i}. {k}")
+            else:
+                lines.append(f"{i}. {k}")
             continue
         summ = (feat.get("fields") or {}).get("summary") or ""
         body = _feature_description_excerpt(validator, feat, max_chars=desc_max_chars)
@@ -370,7 +404,11 @@ def fetch_rice_from_nlm_cli(
     print(f"📓 NotebookLM via nlm: {notebook_name!r} ({nid})")
     print(
         "   RICE prompt: "
-        + ("Jira keys only (use notebook sources)" if keys_only else "includes Jira summary/description"),
+        + (
+            "keys + Jira summaries (set NOTEBOOKLM_RICE_SUMMARY_MAX=0 for keys-only)"
+            if keys_only
+            else "includes Jira summary/description"
+        ),
     )
     timeout = int(os.getenv("NOTEBOOKLM_RICE_QUERY_TIMEOUT", "600"))
 
@@ -424,7 +462,11 @@ async def fetch_rice_from_notebooklm(
         print(f"📓 NotebookLM: {notebook_name} (id {nb.id})")
         print(
             "   RICE prompt: "
-            + ("Jira keys only (use notebook sources)" if keys_only else "includes Jira summary/description"),
+            + (
+                "keys + Jira summaries (set NOTEBOOKLM_RICE_SUMMARY_MAX=0 for keys-only)"
+                if keys_only
+                else "includes Jira summary/description"
+            ),
         )
         for start in range(0, len(features), batch_size):
             batch = features[start : start + batch_size]
@@ -618,8 +660,9 @@ def main() -> int:
         "--rice-jira-context",
         action="store_true",
         help=(
-            "Include Jira summary/description in RICE prompts. Default is **keys only** so NotebookLM "
-            "uses uploaded sources; set NOTEBOOKLM_RICE_INCLUDE_JIRA_CONTEXT=1 for the same without this flag"
+            "Include Jira summary and description excerpts in RICE prompts (full context). "
+            "Default without this flag: each line is key + Jira summary (NOTEBOOKLM_RICE_SUMMARY_MAX); "
+            "set NOTEBOOKLM_RICE_INCLUDE_JIRA_CONTEXT=1 for the same without this flag"
         ),
     )
     parser.add_argument(

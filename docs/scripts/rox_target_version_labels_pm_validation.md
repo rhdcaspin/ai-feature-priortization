@@ -24,4 +24,8 @@ python3 rox_target_version_labels_pm_validation.py --notebooklm-rice
 
 Run `python3 rox_target_version_labels_pm_validation.py --help` for token overrides, RICE options, and output paths.
 
+### NotebookLM “can’t find” an issue (e.g. ROX-26429)
+
+NotebookLM only **indexes uploaded sources**. If the RICE prompt listed **keys only**, issues missing from the latest export could not be resolved. The script now sends **each key with its Jira summary** by default (`NOTEBOOKLM_RICE_SUMMARY_MAX`, default `500`). For even more context, run with **`--rice-jira-context`** or re-upload a fresh feature CSV to the notebook via `rox_feature_export_notebooklm.py`.
+
 See also [README_DAILY_VALIDATION.md](../../README_DAILY_VALIDATION.md) for how this fits a validation workflow.

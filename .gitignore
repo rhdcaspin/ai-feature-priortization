@@ -6,6 +6,8 @@
 
 # ROX export state
 .rox_export_last_run
+.rfe_export_last_run
+.rox_rice_rank_state.json
 
 # Python
 __pycache__/
