@@ -34,14 +34,13 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 
 from jira_auth import is_jira_cloud_url, jira_api_token_from_env  # noqa: E402
+from jira_utils import flatten_value, extract_linked_keys, fetch_cipoe_summary  # noqa: E402
+from rh_api import get_rh_access_token, fetch_case_account_name, extract_sfdc_case_ids  # noqa: E402
 from notebooklm_upload import notebooklm_upload_available, upload_csvs_to_notebook  # noqa: E402
 
 DEFAULT_STATE_FILE = Path(__file__).parent / ".rfe_export_last_run"
 DEFAULT_JIRA_URL = "https://issues.redhat.com"
 DEFAULT_NOTEBOOK_NAME = "The Big Notebook for RHACS Product Management"
-
-RH_SSO_TOKEN_URL = "https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token"
-RH_HYDRA_CASE_URL = "https://access.redhat.com/hydra/rest/cases"
 
 RHACS_COMPONENTS = [
     "rhacs",
@@ -78,171 +77,6 @@ FIELD_IDS = [
     "customfield_12322244",   # PX Impact Score
     "customfield_12324540",   # SFDC Cases Open
 ]
-
-
-def flatten_value(val: Any) -> str:
-    """Convert a Jira field value to a CSV-safe string."""
-    if val is None:
-        return ""
-    if isinstance(val, bool):
-        return "true" if val else "false"
-    if isinstance(val, (int, float)):
-        return str(val)
-    if isinstance(val, str):
-        return val.replace("\r\n", " ").replace("\n", " ").replace("\r", " ").strip()
-    if isinstance(val, dict):
-        for k in ("name", "displayName", "key", "value"):
-            if k in val and val[k] is not None:
-                return str(val[k]).replace("\n", " ")
-        return json.dumps(val)[:500]
-    if isinstance(val, list):
-        parts = []
-        for item in val:
-            if isinstance(item, dict):
-                p = item.get("name") or item.get("displayName") or item.get("key")
-                parts.append(str(p) if p is not None else str(item))
-            else:
-                parts.append(str(item))
-        return " | ".join(str(p) for p in parts if p)
-    return str(val)
-
-
-def get_rh_access_token(offline_token: str) -> Optional[str]:
-    """Exchange a Red Hat offline token for a short-lived access token."""
-    try:
-        resp = requests.post(
-            RH_SSO_TOKEN_URL,
-            data={
-                "grant_type": "refresh_token",
-                "client_id": "rhsm-api",
-                "refresh_token": offline_token,
-            },
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            return resp.json().get("access_token")
-        print(f"  Red Hat SSO token exchange failed: {resp.status_code}")
-    except Exception as e:
-        print(f"  Red Hat SSO error: {e}")
-    return None
-
-
-def fetch_case_account_name(
-    case_number: str, access_token: str, cache: Dict[str, str],
-) -> str:
-    """Look up the account/customer name for a support case via Hydra API."""
-    if case_number in cache:
-        return cache[case_number]
-    try:
-        resp = requests.get(
-            f"{RH_HYDRA_CASE_URL}/{case_number}",
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Accept": "application/json",
-            },
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            account = (
-                data.get("accountName")
-                or data.get("account", {}).get("name", "")
-                or data.get("contactName", "")
-            )
-            cache[case_number] = account
-            return account
-        elif resp.status_code == 404:
-            cache[case_number] = ""
-        else:
-            print(f"  Hydra API {resp.status_code} for case {case_number}")
-    except Exception:
-        pass
-    cache[case_number] = ""
-    return ""
-
-
-def extract_sfdc_case_ids(rfe_fields: Dict, rfe_key: str,
-                          jira_url: str, session: requests.Session,
-                          api_version: str) -> List[str]:
-    """Extract SFDC case IDs from custom fields and remote links of an RFE."""
-    seen: set = set()
-    case_ids: list = []
-
-    sfdc_field = rfe_fields.get("customfield_12313441")
-    if sfdc_field:
-        for case_num in re.split(r"[,\s;|]+", str(sfdc_field).strip()):
-            case_num = case_num.strip()
-            if case_num and case_num not in seen:
-                seen.add(case_num)
-                case_ids.append(case_num)
-
-    try:
-        resp = session.get(
-            f"{jira_url}/rest/api/{api_version}/issue/{rfe_key}/remotelink",
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            for link in resp.json():
-                obj = link.get("object", {}) or {}
-                url_str = obj.get("url", "") or ""
-                title = obj.get("title", "") or ""
-                summary = obj.get("summary", "") or ""
-                combined = f"{url_str} {title} {summary}"
-                if not re.search(r"salesforce|force\.com|sfdc", combined, re.IGNORECASE):
-                    continue
-                for text in [url_str, title, summary]:
-                    m = re.search(r"500[a-zA-Z0-9]{12,15}", text)
-                    if m and m.group() not in seen:
-                        seen.add(m.group())
-                        case_ids.append(m.group())
-                        break
-                else:
-                    for text in [url_str, title, summary]:
-                        m = re.search(r"\b(\d{7,10})\b", text)
-                        if m and m.group() not in seen:
-                            seen.add(m.group())
-                            case_ids.append(m.group())
-                            break
-    except Exception:
-        pass
-
-    return case_ids
-
-
-def extract_linked_keys(issuelinks: List[Dict], prefix: str) -> List[str]:
-    """Extract linked issue keys matching a project prefix (e.g. 'CIPOE', 'ROX')."""
-    keys = []
-    for link in issuelinks or []:
-        for direction in ("inwardIssue", "outwardIssue"):
-            issue = link.get(direction)
-            if issue and isinstance(issue, dict):
-                key = issue.get("key", "")
-                if key and key.upper().startswith(prefix.upper()):
-                    keys.append(key)
-    return list(dict.fromkeys(keys))
-
-
-def fetch_cipoe_summary(
-    cipoe_key: str, jira_url: str, session: requests.Session,
-    api_version: str, cache: Dict[str, str],
-) -> str:
-    """Fetch CIPOE issue summary (customer name) with caching."""
-    if cipoe_key in cache:
-        return cache[cipoe_key]
-    try:
-        resp = session.get(
-            f"{jira_url}/rest/api/{api_version}/issue/{cipoe_key}",
-            params={"fields": "summary"},
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            summary = resp.json().get("fields", {}).get("summary", "")
-            cache[cipoe_key] = summary or cipoe_key
-            return cache[cipoe_key]
-    except Exception:
-        pass
-    cache[cipoe_key] = cipoe_key
-    return cipoe_key
 
 
 def load_last_run(state_file: Path) -> Optional[str]:

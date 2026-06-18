@@ -30,11 +30,11 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
 
+from rh_api import get_rh_access_token  # noqa: E402
 from notebooklm_upload import notebooklm_upload_available, upload_csvs_to_notebook  # noqa: E402
 
 DEFAULT_NOTEBOOK_NAME = "The Big Notebook for RHACS Product Management"
 
-RH_SSO_TOKEN_URL = "https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token"
 RH_HYDRA_SEARCH_URL = "https://access.redhat.com/hydra/rest/search/cases"
 
 RHACS_PRODUCTS = [
@@ -75,26 +75,6 @@ FIELD_MAP = {
 CSV_COLUMNS = list(FIELD_MAP.values())
 
 PAGE_SIZE = 100
-
-
-def get_rh_access_token(offline_token: str) -> Optional[str]:
-    """Exchange a Red Hat offline token for a short-lived access token."""
-    try:
-        resp = requests.post(
-            RH_SSO_TOKEN_URL,
-            data={
-                "grant_type": "refresh_token",
-                "client_id": "rhsm-api",
-                "refresh_token": offline_token,
-            },
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            return resp.json().get("access_token")
-        print(f"  SSO token exchange failed: {resp.status_code}")
-    except Exception as e:
-        print(f"  SSO error: {e}")
-    return None
 
 
 def safe_str(val: Any) -> str:

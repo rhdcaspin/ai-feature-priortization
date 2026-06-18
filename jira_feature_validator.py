@@ -4,7 +4,7 @@ Jira Feature Template Validator
 
 This script connects to a Jira organization using API token authentication,
 filters features by target version (excluding issues in the Done status category, for example Closed),
-and validates them against a required template structure.
+validates them against a required template structure, and exports CSV/Sheets rows in Jira Rank order (ASC).
 
 Usage:
     python3 jira_feature_validator.py --target-version 5.0.0
@@ -290,8 +290,8 @@ class JiraFeatureValidator:
             'statusCategory != Done',
         ]
         
-        jql = ' AND '.join(jql_parts)
-        
+        jql = f"{' AND '.join(jql_parts)} ORDER BY Rank ASC"
+
         print(f"🔍 Using JQL: {jql}")
         
         features = []
