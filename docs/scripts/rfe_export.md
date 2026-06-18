@@ -1,34 +1,46 @@
-# `rfe_export.py`
+# rfe_export.py
 
-## Role
+Exports RHACS RFE (Feature Request) issues from Jira to CSV with SFDC/CIPOE/ROX enrichment and optional NotebookLM upload. Supports incremental runs.
 
-Exports **RFE** Jira issues whose components are RHACS-related to a CSV. Enriches rows with SFDC case IDs, customer account names (Red Hat Hydra API), linked CIPOE customers, and linked **ROX** feature keys. Optionally uploads the CSV to **NotebookLM**.
+## CLI parameters
 
-Supports **incremental** runs using a state file (only issues updated since last run), or full exports.
+| Flag | Default | Env override | Description |
+|------|---------|-------------|-------------|
+| `--skip-upload` | `False` | — | Generate CSV only, skip NotebookLM upload |
+| `--notebook-name` | `The Big Notebook for RHACS Product Management` | `NOTEBOOKLM_NOTEBOOK_NAME` | NotebookLM notebook title |
+| `--force-all` | `False` | — | Export all open RHACS RFEs (ignore last-run state) |
+| `--all-rfes` | `False` | — | Export every RHACS RFE regardless of status or date |
+| `--output` / `-o` | `rfe_rhacs_export_<timestamp>.csv` | — | Output CSV path |
 
-## Prerequisites
+## Environment variables
 
-- `JIRA_TOKEN` / `JIRA_API_TOKEN` and `JIRA_BASE_URL` (default `issues.redhat.com` for RFE).
-- Optional: `RH_OFFLINE_TOKEN` for richer account name resolution via Red Hat APIs.
-- For upload: NotebookLM auth as described in [notebooklm_upload.md](notebooklm_upload.md).
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `JIRA_TOKEN` / `JIRA_API_TOKEN` | Yes | API token |
+| `JIRA_BASE_URL` | Yes | Default: `https://issues.redhat.com` |
+| `JIRA_EMAIL` | Cloud only | Atlassian account email |
+| `RH_OFFLINE_TOKEN` | No | Enables SFDC account name resolution via Hydra |
+| `NOTEBOOKLM_NOTEBOOK_NAME` | No | Default notebook title override |
 
-## Common commands
+## Data flow
 
-```bash
-# Incremental export (since last run), then upload to NotebookLM
-python3 rfe_export.py
+1. Connects to Jira, determines Cloud (v3) vs Server (v2) API
+2. Builds JQL for open RHACS RFEs (component names containing "rhacs")
+3. Incremental mode: filters by `updated >= last_run_date` from `.rfe_export_last_run`
+4. For each RFE, enriches with:
+   - SFDC case IDs from `customfield_12313441` and remote links (via `rh_api.extract_sfdc_case_ids`)
+   - SFDC account names from Red Hat Hydra API (via `rh_api.fetch_case_account_name`)
+   - CIPOE customer names from linked CIPOE issues (via `jira_utils.fetch_cipoe_summary`)
+   - Linked ROX feature keys (via `jira_utils.extract_linked_keys`)
+5. Writes CSV with enrichment columns (`_sfdc_case_ids`, `_sfdc_accounts`, `_cipoe_customers`, `_rox_keys`)
+6. Saves last-run timestamp to `.rfe_export_last_run`
+7. Uploads CSV to NotebookLM (unless `--skip-upload`)
 
-# All open RHACS RFEs (ignores last-run state)
-python3 rfe_export.py --force-all
+## Dependencies
 
-# Every RHACS RFE regardless of status
-python3 rfe_export.py --all-rfes
+- `jira_auth.py`, `jira_utils.py`, `rh_api.py`, `notebooklm_upload.py`
 
-# CSV only
-python3 rfe_export.py --skip-upload
+## Automation
 
-# Custom notebook title or output path
-python3 rfe_export.py --notebook-name "My Notebook" -o ./out/rfe.csv
-```
-
-See `python3 rfe_export.py --help` for the full option list.
+- Part of `run_daily_export.sh` (third script in the daily export job)
+- `com.rox.daily-export.plist` — macOS launchd at 9:00 AM

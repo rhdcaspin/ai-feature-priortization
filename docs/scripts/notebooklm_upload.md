@@ -1,36 +1,35 @@
-# `notebooklm_upload.py`
+# notebooklm_upload.py
 
-## Role
+Unified CSV upload to Google NotebookLM. Supports two backends and auto-selects between them.
 
-Shared library for uploading **CSV files** to a **Google NotebookLM** notebook by title. Other export scripts call `upload_csvs_to_notebook()` after generating a CSV.
+## Backends
 
-**Backends** (controlled by `NOTEBOOKLM_UPLOAD_BACKEND`, default `auto`):
+| Backend | Install | Auth |
+|---------|---------|------|
+| **nlm** (preferred) | `pip install notebooklm-mcp-cli` | `nlm login` |
+| **notebooklm-py** | `pip install 'notebooklm-py[browser]'` | `notebooklm login` |
 
-1. **`nlm`** — CLI from `notebooklm-mcp-cli` (same auth as the NotebookLM MCP flow: `nlm login`).
-2. **`notebooklm-py`** — Python client (`notebooklm login`).
+## Functions
 
-If `auto`, the code prefers `nlm` when it is on `PATH`, otherwise falls back to `notebooklm-py`.
+| Function | Description |
+|----------|-------------|
+| `notebooklm_upload_available()` | Returns `True` if either backend is usable. |
+| `upload_csvs_to_notebook(csv_paths, notebook_name)` | Uploads one or more CSV files to a notebook by title. Creates the notebook if it doesn't exist. Returns `True` on success. |
+| `find_notebook_id_by_title(notebook_title)` | Resolves a notebook UUID by exact title via `nlm`. Returns `None` if not found or `nlm` missing. |
 
-## Usage
+## Environment variables
 
-Import from other scripts; there is **no standalone CLI**.
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NOTEBOOKLM_UPLOAD_BACKEND` | `auto` | `auto` / `nlm` / `py`. Auto tries nlm first, falls back to py on failure. |
 
-```python
-from notebooklm_upload import notebooklm_upload_available, upload_csvs_to_notebook
+## Used by
 
-if notebooklm_upload_available():
-    upload_csvs_to_notebook(["/path/to/report.csv"], "My Notebook Title")
-```
+All export scripts that upload to NotebookLM:
 
-Helper: `find_notebook_id_by_title(title)` resolves a notebook UUID via `nlm` when available.
-
-## Environment
-
-| Variable | Values | Purpose |
-|----------|--------|---------|
-| `NOTEBOOKLM_UPLOAD_BACKEND` | `auto`, `nlm`, `py` | Which uploader to use. |
-
-Install one path:
-
-- `pip install notebooklm-mcp-cli` then `nlm login`, or  
-- `pip install 'notebooklm-py[browser]'` then `notebooklm login`.
+- `rox_feature_export_notebooklm.py`
+- `rfe_export.py`
+- `rfe_rox_mismatch_report.py`
+- `rhacs_telemetry_export.py`
+- `rhacs_cases_export.py`
+- `rox_target_version_labels_pm_validation.py` (uses `find_notebook_id_by_title` for RICE queries)

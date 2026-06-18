@@ -1,28 +1,53 @@
-# `rox_feature_category_labels.py`
+# rox_feature_category_labels.py
 
-## Role
+AI-classifies ROX features into product-pillar labels using a local Ollama model, then syncs Jira labels. Also sets the `enterprise_ready` boolean label.
 
-Uses a **local Ollama** model to classify each selected **ROX Feature** into exactly one **product pillar** Jira label (mutually exclusive set of three slugs) and to set a boolean **`enterprise_ready`** label. Compares current Jira labels to the model output and applies **add/remove** label updates via the Jira REST API (unless `--dry-run`).
+## Pillar labels (mutually exclusive)
 
-## Prerequisites
+- `unified-workload-protection`
+- `frictionless-security-runtime-observability`
+- `ai-driven-vuln-risk-management`
+- `enterprise-scalability-support`
 
-- Running Ollama (`ollama serve`) and a pulled model; set `OLLAMA_MODEL` or pass `--ollama-model`.
-- Jira credentials in `.env` (same family as `jira_feature_validator.py`).
-- Optional: `OLLAMA_BASE_URL`, `OLLAMA_TIMEOUT`, `--ollama-no-json-format` if the model returns weak JSON.
+## CLI parameters
 
-## Common commands
+| Flag | Default | Env override | Description |
+|------|---------|-------------|-------------|
+| `--jql` | ROX features TV 5.0.0 | — | JQL selecting features to classify |
+| `--dry-run` | `False` | — | Print planned changes only |
+| `--apply` | `False` | — | Write label changes to Jira |
+| `--batch-size` | `8` | — | Features per LLM request |
+| `--desc-max` | `3500` | — | Max description chars per feature sent to model |
+| `--delay` | `1.0` | — | Seconds between LLM batches |
+| `--no-single-retry` | `False` | — | Skip single-issue retry when batch omits keys |
+| `--no-plain-fallback` | `False` | — | Skip plain-line (non-JSON) LLM fallback |
+| `--ollama-url` | `http://127.0.0.1:11434` | `OLLAMA_BASE_URL` | Ollama server URL |
+| `--ollama-model` | — | `OLLAMA_MODEL` | Ollama model name (required) |
+| `--ollama-timeout` | `600` | `OLLAMA_TIMEOUT` | Seconds per Ollama request |
+| `--ollama-no-json-format` | `False` | — | Don't use Ollama `format=json` |
 
-```bash
-# Preview planned label changes (no Jira writes)
-OLLAMA_MODEL=llama3.2 python3 rox_feature_category_labels.py --dry-run
+## Environment variables
 
-# Apply after reviewing dry-run
-python3 rox_feature_category_labels.py --apply --ollama-model mistral
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `JIRA_TOKEN` / `JIRA_API_TOKEN` | Yes | API token |
+| `JIRA_BASE_URL` | Yes | Jira URL |
+| `JIRA_EMAIL` | Cloud only | Atlassian account email |
+| `OLLAMA_MODEL` | Yes | Model name (e.g. `llama3.2`, `mistral`) |
+| `OLLAMA_BASE_URL` | No | Default: `http://127.0.0.1:11434` |
+| `OLLAMA_TIMEOUT` | No | Default: `600` seconds |
 
-# Custom JQL selecting which features to process
-python3 rox_feature_category_labels.py --apply --jql 'project = ROX AND type = feature AND "Target Version" = "5.0.0"'
-```
+## Data flow
 
-Exactly **one** pillar label is enforced on each issue: any other pillar from the set is removed when it differs from the model’s choice. If the model returns a compound value (for example two slugs separated by `|`), the script keeps the first recognizable slug. Plain-line fallback does **not** set `enterprise_ready`; JSON paths should include `enterprise_ready` when you want that label synced.
+1. Connects to Jira via `JiraFeatureValidator`
+2. Fetches features matching JQL (summary, description, labels)
+3. Sends batches to Ollama `/api/chat` (or `/api/generate` on older Ollama)
+4. Parses JSON response to get `{key, category, enterprise_ready}` per issue
+5. On missing keys: retries single-issue with JSON, then without JSON format, then plain-line prompt
+6. Computes label updates: removes wrong pillar labels, adds correct one, adds/removes `enterprise_ready`
+7. With `--apply`: writes label updates to Jira via REST API
 
-Run `python3 rox_feature_category_labels.py --help` for batch size, delays, and retry flags.
+## Dependencies
+
+- `jira_auth.py`, `jira_feature_validator.py` (connection, ADF text extraction)
+- Running Ollama server with a pulled model

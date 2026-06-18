@@ -1,39 +1,54 @@
-# `jira_feature_validator.py`
+# jira_feature_validator.py
 
-## Role
+Validates ROX Feature descriptions against a required template, checks RICE field completeness and product-pillar labels, exports a compliance CSV, and optionally uploads to Google Sheets.
 
-Connects to Jira, loads **ROX** issues of type **Feature** for a given **Target Version**, and checks that the description follows the expected product template (Goal Summary, Goals/outcomes, Acceptance Criteria, Success criteria, optional sections). Produces a timestamped **compliance CSV** under `output/`. Optionally uploads that CSV to **Google Sheets** via a `gcloud` access token. On upload, the **Key** column becomes a clickable **HYPERLINK** to `{JIRA_BASE_URL}/browse/<KEY>` (default base `https://redhat.atlassian.net` if unset).
+## CLI parameters
 
-Issues in Jira’s **Done** status category (for example Closed) are **not** fetched, so completed features are excluded from validation.
+| Flag | Default | Env override | Description |
+|------|---------|-------------|-------------|
+| `--target-version` | `5.0.0` | — | Target Version to filter features |
+| `--jira-url` | `https://redhat.atlassian.net` | `JIRA_BASE_URL` | Jira base URL |
+| `--email` | — | `JIRA_EMAIL` | Atlassian account email (required for Cloud) |
+| `--token` | — | `JIRA_TOKEN` / `JIRA_API_TOKEN` | Jira API token |
+| `--no-rice-comments` | `False` | — | Skip posting Jira comments when RICE fields are missing |
+| `--update-sheet` | `False` | — | Upload compliance CSV to Google Sheets |
+| `--sheet-id` | — | `GOOGLE_SHEET_ID` | Google Spreadsheet ID |
+| `--sheet-name` | `5.0 Plan` | `GOOGLE_SHEET_NAME` | Sheet tab name to replace |
 
-## Prerequisites
+## Environment variables
 
-- Python dependencies from `requirements.txt`.
-- `.env` with Jira settings (see below).
-- For `--update-sheet`: `gcloud auth login --enable-gdrive-access` so `gcloud auth print-access-token` works.
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `JIRA_TOKEN` / `JIRA_API_TOKEN` | Yes | API token |
+| `JIRA_BASE_URL` | Yes | Jira site URL |
+| `JIRA_EMAIL` | Cloud only | Atlassian account email |
+| `JIRA_PRODUCT_MANAGER_FIELD` | No | Custom field ID override (default: auto Cloud/Server) |
+| `JIRA_TARGET_VERSION_FIELD` | No | Custom field ID override |
+| `JIRA_RICE_REACH_FIELD` | No | RICE Reach custom field ID (auto-discovered if unset) |
+| `JIRA_RICE_IMPACT_FIELD` | No | RICE Impact custom field ID |
+| `JIRA_RICE_CONFIDENCE_FIELD` | No | RICE Confidence custom field ID |
+| `JIRA_RICE_EFFORT_FIELD` | No | RICE Effort custom field ID |
+| `JIRA_RICE_SCORE_FIELD` | No | RICE Score custom field ID |
+| `JIRA_RANK_FIELD` | No | Rank (LexoRank) custom field ID |
+| `GOOGLE_SHEET_ID` | For `--update-sheet` | Spreadsheet ID |
+| `GOOGLE_SHEET_NAME` | No | Tab name |
 
-## Environment
+## Data flow
 
-| Variable | Purpose |
-|----------|---------|
-| `JIRA_BASE_URL` | Jira site URL (Cloud or Server/DC). |
-| `JIRA_EMAIL` | Required on Atlassian Cloud (paired with API token). |
-| `JIRA_TOKEN` or `JIRA_API_TOKEN` | API token or PAT. |
-| `JIRA_PRODUCT_MANAGER_FIELD`, `JIRA_TARGET_VERSION_FIELD`, `JIRA_RICE_*` | Optional custom field overrides. |
-| `GOOGLE_SHEET_ID`, `GOOGLE_SHEET_NAME` | Optional defaults for `--sheet-id` / `--sheet-name`. |
+1. Connects to Jira, auto-discovers RICE custom field IDs
+2. Fetches ROX Features for the target version (excludes Done status category), ordered by Rank ASC
+3. Validates each feature description against 6 template sections (4 required, 2 optional)
+4. Checks RICE field completeness (Reach, Impact, Confidence, Effort, RICE Score)
+5. Checks for at least one product-pillar label
+6. Posts Jira comment @mentioning PM and Assignee on issues with missing RICE (unless `--no-rice-comments`)
+7. Writes compliance CSV to `output/rox_<version>_compliance_<timestamp>.csv`
+8. Optionally uploads to Google Sheets with HYPERLINK formulas on Key column
 
-## Common commands
+## Dependencies
 
-```bash
-# Validate features for a target version (CSV under output/)
-python3 jira_feature_validator.py --target-version 5.0.0
+- `jira_auth.py` — token and Cloud detection
+- Google Sheets API via `gcloud auth print-access-token` (for `--update-sheet`)
 
-# Jira Cloud example (set JIRA_EMAIL in .env)
-python3 jira_feature_validator.py --target-version 5.0.0 \
-  --jira-url https://your-site.atlassian.net
+## Also provides
 
-# Also push CSV to Google Sheets
-python3 jira_feature_validator.py --target-version 5.0.0 --update-sheet
-```
-
-Run `python3 jira_feature_validator.py --help` for all flags (`--token`, `--sheet-id`, etc.).
+`JiraFeatureValidator` class and `upload_csv_to_google_sheet()` function are imported by other scripts (`rox_rice_rank_sync.py`, `rox_feature_category_labels.py`, `rox_target_version_labels_pm_validation.py`, `rox_assignee_pm_report.py`).

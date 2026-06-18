@@ -1,29 +1,23 @@
-# `jira_auth.py`
+# jira_auth.py
 
-## Role
+Shared helper to read Jira API credentials from environment variables and detect Cloud vs Server instances.
 
-Small shared helper used by other scripts. It reads the Jira API token from the environment and detects whether a Jira base URL is **Atlassian Cloud** (`*.atlassian.net`) versus **Server/Data Center** (for example `issues.redhat.com`), so callers can pick Basic auth (email + token) or Bearer token as appropriate.
+## Functions
 
-## Usage
+| Function | Returns | Description |
+|----------|---------|-------------|
+| `jira_api_token_from_env()` | `str` | Returns `JIRA_TOKEN` (or `JIRA_API_TOKEN` if unset), stripped. Empty string if neither is set. |
+| `is_jira_cloud_url(url)` | `bool` | `True` if the URL contains `atlassian.net` (case-insensitive). Used by all scripts to choose Basic auth (Cloud) vs Bearer token (Server/DC). |
 
-This file is **imported**, not run as a CLI. In your entrypoint script, load `.env` **before** importing if you rely on a project `.env` file:
+## Environment variables
 
-```python
-from pathlib import Path
-from dotenv import load_dotenv
-load_dotenv(Path(__file__).parent / ".env")
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `JIRA_TOKEN` | Yes (or `JIRA_API_TOKEN`) | Jira API token (Cloud) or PAT (Server/DC) |
+| `JIRA_API_TOKEN` | Fallback | Used only if `JIRA_TOKEN` is unset |
 
-from jira_auth import jira_api_token_from_env, is_jira_cloud_url
-```
+## Notes
 
-## Environment
-
-| Variable | Purpose |
-|----------|---------|
-| `JIRA_TOKEN` | Preferred API token (or PAT on Server/DC). |
-| `JIRA_API_TOKEN` | Alternative name if `JIRA_TOKEN` is unset. |
-
-## API
-
-- `jira_api_token_from_env() -> str` — returns stripped token or empty string.
-- `is_jira_cloud_url(url: str) -> bool` — true when the host indicates Jira Cloud.
+- This file is **imported**, not run as a CLI.
+- Does **not** call `load_dotenv` itself. The importing script must load `.env` before importing.
+- All Python scripts in this repo import from this module for token access and Cloud detection.

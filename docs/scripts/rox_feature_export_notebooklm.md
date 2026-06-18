@@ -1,26 +1,50 @@
-# `rox_feature_export_notebooklm.py`
+# rox_feature_export_notebooklm.py
 
-## Role
+Exports ROX project features to CSV with SFDC/CIPOE/RFE customer enrichment and optional NotebookLM upload. Supports incremental runs.
 
-Exports **ROX** Jira **features** updated since the last run (or a rolling window on first run) to CSV, including key fields and customer names resolved via **Red Hat Hydra** when `RH_OFFLINE_TOKEN` is set (CIPOE / case linkage logic is in-script). Uploads the CSV to **NotebookLM** by default.
+## CLI parameters
 
-State is kept in `.rox_export_last_run` so subsequent runs are incremental.
+| Flag | Default | Env override | Description |
+|------|---------|-------------|-------------|
+| `--skip-upload` | `False` | — | Generate CSV only, skip NotebookLM upload |
+| `--notebook-name` | `The Big Notebook for RHACS Product Management` | — | NotebookLM notebook title |
+| `--force-all` | `False` | — | Export open features (ignore last-run state) |
+| `--all-features` | `False` | — | Export ALL features regardless of status or date |
+| `--output` / `-o` | `rox_features_export_<timestamp>.csv` | — | Output CSV path |
 
-## Prerequisites
+## Environment variables
 
-- `JIRA_TOKEN` / `JIRA_API_TOKEN`, `JIRA_BASE_URL`, and on Cloud `JIRA_EMAIL`.
-- Optional: `RH_OFFLINE_TOKEN` for account name enrichment.
-- NotebookLM: see [notebooklm_upload.md](notebooklm_upload.md).
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `JIRA_TOKEN` / `JIRA_API_TOKEN` | Yes | API token |
+| `JIRA_BASE_URL` | Yes | Default: `https://issues.redhat.com` |
+| `JIRA_EMAIL` | Cloud only | Atlassian account email |
+| `RH_OFFLINE_TOKEN` | No | Enables SFDC account name resolution via Hydra |
+| `JIRA_RICE_SCORE_FIELD` | No | Override for RICE Score field ID (auto-discovered otherwise) |
 
-## Common commands
+## Data flow
 
-```bash
-python3 rox_feature_export_notebooklm.py
-python3 rox_feature_export_notebooklm.py --skip-upload
-python3 rox_feature_export_notebooklm.py --force-all
-python3 rox_feature_export_notebooklm.py --all-features
-```
+1. Connects to Jira, auto-discovers RICE custom field IDs
+2. Builds JQL for open ROX features (Backlog, New, Refinement, To Do)
+3. Incremental mode: filters by `updated >= last_run_date` from `.rox_export_last_run`
+4. For each feature, enriches with:
+   - SFDC case IDs from all fields and remote links (local `extract_sfdc_case_ids` — broader scan than `rh_api.py` version)
+   - CIPOE customer names: direct ROX->CIPOE links + indirect ROX->RFE->CIPOE links
+   - RFE SFDC accounts: ROX->RFE->Salesforce case->Hydra account name
+   - RICE scores (Reach, Impact, Confidence, Effort, RICE Score)
+5. Writes CSV with priority columns: key, SFDC case IDs, RFE keys, RFE SFDC accounts, CIPOE customers, then RICE, then remaining fields
+6. Saves last-run timestamp to `.rox_export_last_run`
+7. Uploads CSV to NotebookLM (unless `--skip-upload`)
 
-Optional flags include `--notebook-name`, `--drive-folder-id`, and output-related options. See `python3 rox_feature_export_notebooklm.py --help`.
+## Dependencies
 
-This script is what `run_daily_export.sh` invokes for the ROX portion of the daily job; see [README_DAILY_EXPORT.md](../../README_DAILY_EXPORT.md).
+- `jira_auth.py`, `jira_utils.py` (flatten_value, fetch_cipoe_summary), `rh_api.py` (get_rh_access_token, fetch_case_account_name), `notebooklm_upload.py`
+
+## Note
+
+This script has its **own** `extract_sfdc_case_ids` function (different from `rh_api.py`). It scans all issue fields for SFDC-pattern values and uses a cache keyed by issue_key. The `rh_api.py` version only checks `customfield_12313441` and remote links.
+
+## Automation
+
+- First script in `run_daily_export.sh`
+- `com.rox.daily-export.plist` — macOS launchd at 9:00 AM
