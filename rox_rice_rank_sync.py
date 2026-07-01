@@ -26,6 +26,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1070,6 +1071,37 @@ def update_state_from_features(
     bucket["last_run_at"] = _utc_now_iso()
 
 
+RANK_LABEL_RE = re.compile(r"^rice-rank-\d+_\d{8}$")
+
+
+def sync_rank_position_labels(
+    session: requests.Session,
+    jira_url: str,
+    api_version: str,
+    cohort_keys_ordered: List[str],
+    labels_by_key: Dict[str, List[str]],
+    date_str: str,
+) -> int:
+    """Add/update ``rice-rank-NN_YYYYMMDD`` label on each cohort issue."""
+    updated = 0
+    for pos_0, key in enumerate(cohort_keys_ordered):
+        pos = pos_0 + 1
+        new_label = f"rice-rank-{pos}_{date_str}"
+        current = labels_by_key.get(key, [])
+        old_rank_labels = [lb for lb in current if RANK_LABEL_RE.match(lb)]
+        if old_rank_labels == [new_label]:
+            continue
+        ops: List[Dict[str, str]] = [{"remove": lb} for lb in old_rank_labels]
+        ops.append({"add": new_label})
+        url = f"{jira_url.rstrip('/')}/rest/api/{api_version}/issue/{key}"
+        resp = session.put(url, json={"update": {"labels": ops}})
+        if resp.status_code in (200, 204):
+            updated += 1
+        else:
+            print(f"   ⚠️  Label update failed for {key}: {resp.status_code}")
+    return updated
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Order ROX Feature Rank by RICE Score (respect manual rank overrides)",
@@ -1580,6 +1612,34 @@ def main() -> int:
         )
     else:
         print("   ✅ LexoRank order matches RICE (+ Reach tie-break) for ranked issues")
+
+    # Sync rank-position labels on all cohort issues
+    final_order = _search_jql_all_keys(
+        validator.session,
+        validator.jira_url,
+        f"{cohort_jql} ORDER BY Rank ASC",
+        is_cloud,
+        fields="key",
+    )
+    # Refresh labels after rank moves
+    refreshed_labels: Dict[str, List[str]] = {}
+    for issue in features:
+        k = issue.get("key") or ""
+        refreshed_labels[k] = list((issue.get("fields") or {}).get("labels") or [])
+    date_tag = datetime.now(timezone.utc).strftime("%Y%m%d")
+    api_ver = "3" if is_cloud else "2"
+    label_count = sync_rank_position_labels(
+        validator.session,
+        validator.jira_url,
+        api_ver,
+        final_order,
+        refreshed_labels,
+        date_tag,
+    )
+    if label_count:
+        print(f"   🏷️  Updated rank position labels on {label_count} issue(s)")
+    else:
+        print("   🏷️  Rank position labels already current")
 
     print(
         f"   Tip: add label {args.manual_label!r} to lock rank, or edit rank in Jira "
