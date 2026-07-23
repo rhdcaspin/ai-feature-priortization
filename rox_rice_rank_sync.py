@@ -1090,7 +1090,7 @@ def _adf_text(text: str) -> dict:
 def _adf_mention(account_id: str, display_name: str) -> dict:
     return {
         "type": "mention",
-        "attrs": {"id": account_id, "text": f"@{display_name}", "userType": "atlassian"},
+        "attrs": {"id": account_id, "text": f"@{display_name}", "accessLevel": "APPLICATION"},
     }
 
 
