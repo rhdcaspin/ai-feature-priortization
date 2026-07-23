@@ -1072,6 +1072,151 @@ def update_state_from_features(
 
 
 RANK_LABEL_RE = re.compile(r"^rice-rank-\d+_\d{8}$")
+TV_LABEL_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
+
+def _adf_doc(*paragraphs: dict) -> dict:
+    return {"version": 1, "type": "doc", "content": list(paragraphs)}
+
+
+def _adf_para(*inline: dict) -> dict:
+    return {"type": "paragraph", "content": list(inline)}
+
+
+def _adf_text(text: str) -> dict:
+    return {"type": "text", "text": text}
+
+
+def _adf_mention(account_id: str, display_name: str) -> dict:
+    return {
+        "type": "mention",
+        "attrs": {"id": account_id, "text": f"@{display_name}", "userType": "atlassian"},
+    }
+
+
+def post_jira_comment(
+    session: requests.Session,
+    jira_url: str,
+    api_version: str,
+    issue_key: str,
+    body_adf: dict,
+) -> bool:
+    url = f"{jira_url.rstrip('/')}/rest/api/{api_version}/issue/{issue_key}/comment"
+    resp = session.post(url, json={"body": body_adf})
+    return resp.status_code in (200, 201)
+
+
+def validate_data_quality(
+    session: requests.Session,
+    jira_url: str,
+    api_version: str,
+    features: List[dict],
+    rice_by_key: Dict[str, Optional[float]],
+    labels_by_key: Dict[str, List[str]],
+    target_version: str,
+    do_comment: bool,
+) -> Tuple[int, int]:
+    """Validate RICE Score presence and TV label correctness for all cohort features.
+
+    Posts a Jira comment mentioning the assignee (or PM) for each violation when
+    *do_comment* is True.  Returns (rice_violations, tv_violations).
+    """
+    rice_violations: List[str] = []
+    tv_violations: List[str] = []
+    commented: List[str] = []
+
+    for issue in features:
+        key = issue.get("key") or ""
+        fields = issue.get("fields") or {}
+
+        # Resolve who to mention: prefer assignee, fall back to Product Manager
+        assignee = fields.get("assignee") or {}
+        pm = fields.get("customfield_10469") or {}
+        contact = assignee if assignee.get("accountId") else pm
+        account_id = contact.get("accountId", "")
+        display_name = contact.get("displayName", "assignee")
+
+        rice = rice_by_key.get(key)
+        labels = labels_by_key.get(key, [])
+        tv_labels = [lb for lb in labels if TV_LABEL_RE.match(lb)]
+
+        # --- Validation 1: RICE Score ---
+        if rice is None:
+            rice_violations.append(key)
+            if do_comment and account_id:
+                body = _adf_doc(
+                    _adf_para(
+                        _adf_mention(account_id, display_name),
+                        _adf_text(
+                            f" this feature is missing a RICE Score"
+                            f" (Reach × Impact × Confidence / Effort)."
+                            f" Without a score it will be placed at the bottom of the"
+                            f" {target_version} backlog and cannot be ranked automatically."
+                            f" Please fill in all four RICE components."
+                        ),
+                    )
+                )
+                if post_jira_comment(session, jira_url, api_version, key, body):
+                    commented.append(key)
+                else:
+                    print(f"   ⚠️  Comment failed for {key} (RICE)")
+
+        # --- Validation 2: TV label ---
+        # Exactly one version-like label, and it must match target_version.
+        if len(tv_labels) == 0:
+            tv_violations.append(key)
+            if do_comment and account_id:
+                body = _adf_doc(
+                    _adf_para(
+                        _adf_mention(account_id, display_name),
+                        _adf_text(
+                            f' this feature has no release label.'
+                            f' Please add label "{target_version}" to match its Target Version.'
+                        ),
+                    )
+                )
+                if post_jira_comment(session, jira_url, api_version, key, body):
+                    commented.append(key)
+                else:
+                    print(f"   ⚠️  Comment failed for {key} (TV label missing)")
+        elif target_version not in tv_labels or len(tv_labels) > 1:
+            tv_violations.append(key)
+            if do_comment and account_id:
+                if target_version not in tv_labels:
+                    msg = (
+                        f' this feature has release label(s) {tv_labels} but its'
+                        f' Target Version is "{target_version}".'
+                        f' Please replace the label(s) with "{target_version}".'
+                    )
+                else:
+                    extra = [lb for lb in tv_labels if lb != target_version]
+                    msg = (
+                        f' this feature has multiple release labels: {tv_labels}.'
+                        f' There should be exactly one label matching the Target Version'
+                        f' ("{target_version}"). Please remove: {extra}.'
+                    )
+                body = _adf_doc(_adf_para(_adf_mention(account_id, display_name), _adf_text(msg)))
+                if post_jira_comment(session, jira_url, api_version, key, body):
+                    commented.append(key)
+                else:
+                    print(f"   ⚠️  Comment failed for {key} (TV label mismatch)")
+
+    # --- Summary ---
+    print(f"\n🔍 Data quality ({target_version} cohort):")
+    if rice_violations:
+        print(f"   ❌ Missing RICE Score ({len(rice_violations)}): {', '.join(rice_violations)}")
+    else:
+        print("   ✅ All features have a RICE Score")
+    if tv_violations:
+        print(f"   ❌ TV label issues ({len(tv_violations)}): {', '.join(tv_violations)}")
+    else:
+        print(f'   ✅ All features have exactly one "{target_version}" label')
+    if do_comment and commented:
+        print(f"   💬 Jira comments posted on {len(commented)} issue(s): {', '.join(commented)}")
+    elif not do_comment and (rice_violations or tv_violations):
+        print("   💡 Run with --apply to post Jira comments to assignees")
+
+    return len(rice_violations), len(tv_violations)
 
 
 def sync_rank_position_labels(
@@ -1285,7 +1430,8 @@ def main() -> int:
         print(f"🔍 Cohort ({args.cohort}): {cohort_jql}")
 
     reach_field = (validator.rice_field_ids().get("reach") or "").strip()
-    fields_param = f"labels,{rank_field},{rice_field}"
+    pm_field = os.getenv("JIRA_PRODUCT_MANAGER_FIELD", "customfield_10469")
+    fields_param = f"labels,{rank_field},{rice_field},assignee,{pm_field}"
     if not args.ignore_links:
         fields_param += ",issuelinks"
     if reach_field:
@@ -1328,6 +1474,18 @@ def main() -> int:
     blocks_map: Optional[Dict[str, set[str]]] = None
     if not args.ignore_links:
         blocks_map = build_blocks_map(features, set(rice_by_key.keys()))
+
+    api_ver = "3" if is_cloud else "2"
+    validate_data_quality(
+        validator.session,
+        validator.jira_url,
+        api_ver,
+        features,
+        rice_by_key,
+        labels_by_key,
+        args.target_version,
+        do_comment=do_apply,
+    )
 
     rice_changes = detect_rice_score_changes(bucket, rice_by_key)
     unlocked = unlock_state_on_rice_change(bucket, rice_changes)
