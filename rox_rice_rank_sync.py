@@ -1219,6 +1219,97 @@ def validate_data_quality(
     return len(rice_violations), len(tv_violations)
 
 
+def _get_in_progress_transition_id(
+    session: requests.Session, jira_url: str, api_version: str, issue_key: str
+) -> Optional[str]:
+    """Return the transition ID for moving *issue_key* to 'In Progress', or None."""
+    url = f"{jira_url.rstrip('/')}/rest/api/{api_version}/issue/{issue_key}/transitions"
+    resp = session.get(url, timeout=30)
+    if resp.status_code != 200:
+        return None
+    for t in resp.json().get("transitions") or []:
+        if t.get("name") == "In Progress":
+            return t.get("id")
+    return None
+
+
+def auto_progress_features(
+    session: requests.Session,
+    jira_url: str,
+    api_version: str,
+    features: List[dict],
+    is_cloud: bool,
+    do_apply: bool,
+) -> int:
+    """Transition features to In Progress when a child Epic is already In Progress.
+
+    Only features that are not already active (In Progress / Review / Release Pending)
+    are considered.  Returns the number of features transitioned.
+    """
+    ACTIVE_STATUSES = {"In Progress", "Review", "Release Pending"}
+
+    candidates = [
+        iss["key"]
+        for iss in features
+        if (
+            ((iss.get("fields") or {}).get("status") or {}).get("statusCategory", {}).get("name")
+            != "Done"
+            and ((iss.get("fields") or {}).get("status") or {}).get("name")
+            not in ACTIVE_STATUSES
+        )
+    ]
+    if not candidates:
+        return 0
+
+    # Search for in-progress child Epics whose parent is one of the candidates
+    keys_str = ",".join(candidates)
+    jql = (
+        f'project = ROX AND type = Epic AND statusCategory = "In Progress"'
+        f" AND parent in ({keys_str})"
+    )
+    epics = fetch_cohort_features(session, jira_url, jql, "parent,summary", is_cloud)
+
+    feat_summary = {iss["key"]: (iss.get("fields") or {}).get("summary", "")[:55] for iss in features}
+
+    feat_to_epics: Dict[str, List[str]] = {}
+    for epic in epics:
+        parent_key = (((epic.get("fields") or {}).get("parent") or {}).get("key") or "")
+        if parent_key in candidates:
+            feat_to_epics.setdefault(parent_key, []).append(epic["key"])
+
+    if not feat_to_epics:
+        return 0
+
+    print(f"\n🔄 Features with In-Progress epics but feature not yet In Progress ({len(feat_to_epics)}):")
+    for feat_key in sorted(feat_to_epics):
+        print(f"   {feat_key}: {feat_summary.get(feat_key, '')}")
+        print(f"   └─ in-progress epic(s): {', '.join(feat_to_epics[feat_key])}")
+
+    if not do_apply:
+        print("   💡 Run with --apply to auto-transition these features to In Progress")
+        return 0
+
+    in_progress_tid: Optional[str] = None
+    transitioned = 0
+    for feat_key in sorted(feat_to_epics):
+        if in_progress_tid is None:
+            in_progress_tid = _get_in_progress_transition_id(
+                session, jira_url, api_version, feat_key
+            )
+            if not in_progress_tid:
+                print(f"   ⚠️  'In Progress' transition not found for {feat_key}")
+                continue
+        t_url = f"{jira_url.rstrip('/')}/rest/api/{api_version}/issue/{feat_key}/transitions"
+        r = session.post(t_url, json={"transition": {"id": in_progress_tid}}, timeout=30)
+        if r.status_code in (200, 204):
+            transitioned += 1
+            print(f"   ✅ {feat_key} → In Progress (epic: {', '.join(feat_to_epics[feat_key])})")
+        else:
+            print(f"   ⚠️  Transition failed for {feat_key}: {r.status_code}")
+
+    return transitioned
+
+
 def sync_rank_position_labels(
     session: requests.Session,
     jira_url: str,
@@ -1431,7 +1522,7 @@ def main() -> int:
 
     reach_field = (validator.rice_field_ids().get("reach") or "").strip()
     pm_field = os.getenv("JIRA_PRODUCT_MANAGER_FIELD", "customfield_10469")
-    fields_param = f"labels,{rank_field},{rice_field},assignee,{pm_field}"
+    fields_param = f"labels,{rank_field},{rice_field},assignee,{pm_field},status"
     if not args.ignore_links:
         fields_param += ",issuelinks"
     if reach_field:
@@ -1485,6 +1576,14 @@ def main() -> int:
         labels_by_key,
         args.target_version,
         do_comment=do_apply,
+    )
+    auto_progress_features(
+        validator.session,
+        validator.jira_url,
+        api_ver,
+        features,
+        is_cloud,
+        do_apply,
     )
 
     rice_changes = detect_rice_score_changes(bucket, rice_by_key)
