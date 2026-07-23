@@ -635,7 +635,7 @@ def rank_issues_batch(
         body["rankAfterIssue"] = rank_after
     else:
         return False, "need rank_before or rank_after"
-    resp = session.put(url, json=body, timeout=120)
+    resp = session.put(url, json=body, params={"notifyUsers": "false"}, timeout=120)
     if resp.status_code in (200, 204):
         return True, "ok"
     return False, f"{resp.status_code} {resp.text[:400]}"
@@ -1300,7 +1300,7 @@ def auto_progress_features(
                 print(f"   ⚠️  'In Progress' transition not found for {feat_key}")
                 continue
         t_url = f"{jira_url.rstrip('/')}/rest/api/{api_version}/issue/{feat_key}/transitions"
-        r = session.post(t_url, json={"transition": {"id": in_progress_tid}}, timeout=30)
+        r = session.post(t_url, json={"transition": {"id": in_progress_tid}}, params={"notifyUsers": "false"}, timeout=30)
         if r.status_code in (200, 204):
             transitioned += 1
             print(f"   ✅ {feat_key} → In Progress (epic: {', '.join(feat_to_epics[feat_key])})")
@@ -1330,7 +1330,7 @@ def sync_rank_position_labels(
         ops: List[Dict[str, str]] = [{"remove": lb} for lb in old_rank_labels]
         ops.append({"add": new_label})
         url = f"{jira_url.rstrip('/')}/rest/api/{api_version}/issue/{key}"
-        resp = session.put(url, json={"update": {"labels": ops}})
+        resp = session.put(url, json={"update": {"labels": ops}}, params={"notifyUsers": "false"})
         if resp.status_code in (200, 204):
             updated += 1
         else:
