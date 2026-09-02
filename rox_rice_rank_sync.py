@@ -48,6 +48,9 @@ RICE_EPSILON = 1e-9
 # Jira Software Rank API rejects more than 50 issues per request
 RANK_API_MAX_ISSUES = 50
 
+GA_STATUSES = {"GA", "Generally Available", "Released"}
+IN_PROGRESS_STATUSES = {"In Progress", "Review", "Release Pending"}
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -88,6 +91,40 @@ def _parse_reach_score(raw: Any) -> Optional[float]:
     return _parse_rice_score(raw)
 
 
+def _parse_confidence_pct(raw: Any) -> Optional[float]:
+    """Parse confidence field to 0-1 float.
+
+    Handles Jira option strings like '100% (High)', '75% (Medium)', '50% (Low)',
+    plain percentages, or raw numeric values (treated as 0-100 if > 1).
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        v = float(raw)
+        return v / 100.0 if v > 1.0 else v
+    if isinstance(raw, dict):
+        raw = raw.get("value") or raw.get("name")
+    if isinstance(raw, str):
+        m = re.match(r"(\d+(?:\.\d+)?)\s*%", raw.strip())
+        if m:
+            return float(m.group(1)) / 100.0
+    return None
+
+
+def _parse_reach_method(raw: Any) -> Optional[str]:
+    """Extract reach method label from a Jira option/string field."""
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        return raw.strip() or None
+    if isinstance(raw, dict):
+        v = (raw.get("value") or raw.get("name") or "").strip()
+        return v or None
+    return None
+
+
 def _reach_tiebreaker_desc(
     key: str,
     reach_by_key: Optional[Dict[str, Optional[float]]],
@@ -112,6 +149,15 @@ def _reach_tiebreaker_asc(
     if reach is None:
         return 1e18
     return reach
+
+
+def _status_tier(status_name: Optional[str]) -> int:
+    """Sort priority tier based on status: 0=GA, 1=In Progress, 2=other (lower = ranked higher)."""
+    if status_name in GA_STATUSES:
+        return 0
+    if status_name in IN_PROGRESS_STATUSES:
+        return 1
+    return 2
 
 
 def build_blocks_map(
@@ -352,17 +398,19 @@ def sort_keys_by_rice_desc(
     keys: List[str],
     rice_by_key: Dict[str, Optional[float]],
     reach_by_key: Optional[Dict[str, Optional[float]]] = None,
+    status_by_key: Optional[Dict[str, Optional[str]]] = None,
 ) -> List[str]:
-    """Highest RICE first; equal RICE → higher Reach first; missing RICE last."""
+    """Highest RICE first; equal RICE → GA/In-Progress first → higher Reach; missing RICE last."""
 
     def sort_key(k: str) -> Tuple[Any, ...]:
         score = rice_by_key.get(k)
+        st = _status_tier((status_by_key or {}).get(k))
         reach_tie = _reach_tiebreaker_desc(k, reach_by_key)
         if score is None:
-            return (2, 0.0, reach_tie, k)
+            return (2, st, 0.0, reach_tie, k)
         if abs(score) <= RICE_EPSILON:
-            return (1, 0.0, reach_tie, k)
-        return (0, -score, reach_tie, k)
+            return (1, st, 0.0, reach_tie, k)
+        return (0, -score, st, reach_tie, k)
 
     return sorted(keys, key=sort_key)
 
@@ -407,12 +455,13 @@ def rank_segment_after_anchor(
     rice_by_key: Dict[str, Optional[float]],
     reach_by_key: Optional[Dict[str, Optional[float]]] = None,
     blocks_map: Optional[Dict[str, set[str]]] = None,
+    status_by_key: Optional[Dict[str, Optional[str]]] = None,
 ) -> Tuple[bool, str]:
     """Place *segment_keys* directly under *anchor* (locked), highest RICE at top of segment."""
     if not segment_keys:
         return True, "empty"
     # High → low: first issue sits just below anchor (row # anchor+1 in Rank ASC).
-    chain = sort_keys_by_rice_desc(segment_keys, rice_by_key, reach_by_key)
+    chain = sort_keys_by_rice_desc(segment_keys, rice_by_key, reach_by_key, status_by_key)
     chain, _ = promote_blockers(chain, blocks_map)
     prev = anchor
     for key in chain:
@@ -434,11 +483,12 @@ def rank_segment_before_anchor(
     rice_by_key: Dict[str, Optional[float]],
     reach_by_key: Optional[Dict[str, Optional[float]]] = None,
     blocks_map: Optional[Dict[str, set[str]]] = None,
+    status_by_key: Optional[Dict[str, Optional[str]]] = None,
 ) -> Tuple[bool, str]:
     """Place *segment_keys* directly above *anchor* (locked), highest RICE at top of segment."""
     if not segment_keys:
         return True, "empty"
-    desc = sort_keys_by_rice_desc(segment_keys, rice_by_key, reach_by_key)
+    desc = sort_keys_by_rice_desc(segment_keys, rice_by_key, reach_by_key, status_by_key)
     desc, _ = promote_blockers(desc, blocks_map)
     chain = list(reversed(desc))
     next_below = anchor
@@ -458,6 +508,7 @@ def _redistribute_for_segments(
     rice_by_key: Dict[str, Optional[float]],
     reach_by_key: Optional[Dict[str, Optional[float]]] = None,
     blocks_map: Optional[Dict[str, set[str]]] = None,
+    status_by_key: Optional[Dict[str, Optional[str]]] = None,
 ) -> List[str]:
     """Reassign rankable issues to RICE-correct segments before splitting.
 
@@ -465,7 +516,7 @@ def _redistribute_for_segments(
     Rankable issue slots are filled in RICE-descending order so each issue
     lands in the segment that matches its score, not its stale Jira position.
     """
-    rice_sorted = sort_keys_by_rice_desc(list(keys_to_rank), rice_by_key, reach_by_key)
+    rice_sorted = sort_keys_by_rice_desc(list(keys_to_rank), rice_by_key, reach_by_key, status_by_key)
     rice_sorted, _ = promote_blockers(rice_sorted, blocks_map)
     rice_iter = iter(rice_sorted)
     result = []
@@ -494,12 +545,13 @@ def apply_rice_rank_segments(
     dry_run: bool,
     reach_by_key: Optional[Dict[str, Optional[float]]] = None,
     blocks_map: Optional[Dict[str, set[str]]] = None,
+    status_by_key: Optional[Dict[str, Optional[str]]] = None,
 ) -> Tuple[bool, str]:
     """
     Reorder only ``keys_to_rank``; issues with ``rice-rank-manual`` stay fixed as anchors.
     """
     rank_order = _redistribute_for_segments(
-        rank_order, keys_to_rank, rice_by_key, reach_by_key, blocks_map,
+        rank_order, keys_to_rank, rice_by_key, reach_by_key, blocks_map, status_by_key,
     )
     segments = iter_rank_segments(rank_order, keys_to_rank, label_anchors)
     unlocked_count = sum(len(s["keys"]) for s in segments)
@@ -515,7 +567,7 @@ def apply_rice_rank_segments(
             keys = seg["keys"]
             if not keys:
                 continue
-            seg_desc = sort_keys_by_rice_desc(keys, rice_by_key, reach_by_key)
+            seg_desc = sort_keys_by_rice_desc(keys, rice_by_key, reach_by_key, status_by_key)
             seg_desc, _ = promote_blockers(seg_desc, blocks_map)
             top = seg_desc[0]
             top_reach = (reach_by_key or {}).get(top)
@@ -542,6 +594,7 @@ def apply_rice_rank_segments(
                 rice_by_key,
                 reach_by_key,
                 blocks_map,
+                status_by_key,
             )
         elif seg["below"]:
             ok, msg = rank_segment_before_anchor(
@@ -553,9 +606,10 @@ def apply_rice_rank_segments(
                 rice_by_key,
                 reach_by_key,
                 blocks_map,
+                status_by_key,
             )
         else:
-            seg_desc = sort_keys_by_rice_desc(keys, rice_by_key, reach_by_key)
+            seg_desc = sort_keys_by_rice_desc(keys, rice_by_key, reach_by_key, status_by_key)
             seg_desc, _ = promote_blockers(seg_desc, blocks_map)
             ok, msg = apply_rice_rank_order(
                 session,
@@ -569,6 +623,7 @@ def apply_rice_rank_segments(
                 rank_view="asc",
                 reach_by_key=reach_by_key,
                 blocks_map=blocks_map,
+                status_by_key=status_by_key,
             )
         if not ok:
             return False, msg
@@ -582,22 +637,25 @@ def sort_keys_by_rice_asc(
     keys: List[str],
     rice_by_key: Dict[str, Optional[float]],
     reach_by_key: Optional[Dict[str, Optional[float]]] = None,
+    status_by_key: Optional[Dict[str, Optional[str]]] = None,
 ) -> List[str]:
     """
     Bottom-of-backlog → top-of-backlog order for ``rankBeforeIssue`` batches.
 
     Jira places the **last** issue in the array highest on the board. We want:
-    no RICE / 0 at the bottom, highest RICE at the top; equal RICE → higher Reach later.
+    no RICE / 0 at the bottom, highest RICE at the top; equal RICE → GA/In-Progress later
+    (closer to top of board) → higher Reach later.
     """
 
     def sort_key(k: str) -> Tuple[Any, ...]:
         score = rice_by_key.get(k)
+        st = _status_tier((status_by_key or {}).get(k))
         reach_tie = _reach_tiebreaker_asc(k, reach_by_key)
         if score is None:
-            return (0, 0.0, reach_tie, k)  # bottom
+            return (0, -st, 0.0, reach_tie, k)  # bottom
         if abs(score) <= RICE_EPSILON:
-            return (1, 0.0, reach_tie, k)
-        return (2, score, reach_tie, k)  # ascending positive scores
+            return (1, -st, 0.0, reach_tie, k)
+        return (2, score, -st, reach_tie, k)  # ascending positive scores
 
     return sorted(keys, key=sort_key)
 
@@ -814,6 +872,7 @@ def apply_rice_rank_order(
     rank_view: str = "asc",
     reach_by_key: Optional[Dict[str, Optional[float]]] = None,
     blocks_map: Optional[Dict[str, set[str]]] = None,
+    status_by_key: Optional[Dict[str, Optional[str]]] = None,
 ) -> Tuple[bool, str]:
     """
     Order Rank to match RICE (high → low); equal RICE → higher Reach first.
@@ -837,10 +896,11 @@ def apply_rice_rank_order(
         [k for k in scored_keys if abs(rice_by_key.get(k) or 0) <= RICE_EPSILON],
         rice_by_key,
         reach_by_key,
+        status_by_key,
     )
-    rice_keys_asc = sort_keys_by_rice_asc(positive_rice_keys, rice_by_key, reach_by_key)
+    rice_keys_asc = sort_keys_by_rice_asc(positive_rice_keys, rice_by_key, reach_by_key, status_by_key)
     no_rice_keys = sort_keys_by_rice_asc(
-        [k for k in keys if rice_by_key.get(k) is None], rice_by_key, reach_by_key
+        [k for k in keys if rice_by_key.get(k) is None], rice_by_key, reach_by_key, status_by_key
     )
     rice_keys_desc = list(reversed(rice_keys_asc))
     view = (rank_view or "asc").strip().lower()
@@ -877,6 +937,7 @@ def apply_rice_rank_order(
             [k for k in keys if rice_by_key.get(k) is not None],
             rice_by_key,
             reach_by_key,
+            status_by_key,
         )
         scored_chain, _ = promote_blockers(scored_chain, blocks_map)
         _, tail_anchor = cohort_rank_edge_keys(
@@ -977,8 +1038,13 @@ def count_rice_rank_misalignment(
     rice_field: str,
     is_cloud: bool,
     reach_field: str = "",
+    exclude_keys: Optional[set] = None,
 ) -> int:
-    """Count adjacent pairs out of RICE (then Reach) order among unlocked issues."""
+    """Count adjacent pairs out of RICE (then Reach) order among unlocked issues.
+
+    Pairs where either member is in ``exclude_keys`` (e.g. label anchors) are skipped
+    because their position is intentionally fixed and cannot be resolved by re-ranking.
+    """
     if len(keys) < 2:
         return 0
     fields_param = f"{rank_field},{rice_field}"
@@ -1017,6 +1083,8 @@ def count_rice_rank_misalignment(
     bad = 0
     for i in range(len(ordered_keys) - 1):
         a, b = ordered_keys[i], ordered_keys[i + 1]
+        if exclude_keys and (a in exclude_keys or b in exclude_keys):
+            continue
         ra, rb = fresh_rice.get(a), fresh_rice.get(b)
         if ra is None or rb is None:
             continue
@@ -1071,8 +1139,19 @@ def update_state_from_features(
     bucket["last_run_at"] = _utc_now_iso()
 
 
-RANK_LABEL_RE = re.compile(r"^rice-rank-\d+_\d{8}$")
+# Matches both old format (rice-rank-NN_YYYYMMDD) and new format (rice::rank-NN_YYYYMMDD)
+# so that old labels are cleaned up automatically on the first run after migration.
+RANK_LABEL_RE = re.compile(r"^rice(?:-rank-|::rank-)\d+_\d{8}$")
 TV_LABEL_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
+# rice:: reach-tier labels → canonical Reach value.
+# Source of truth: RHACS RICE scoring rubric table.
+REACH_LABEL_MAP: Dict[str, float] = {
+    "rice::renewal-blocker": 48.0,      # Hard customer commitment / regulatory mandate
+    "rice::strategic-initiative": 40.0,  # OKR / cross-team dependency
+    "rice::field-signal": 32.0,          # Strong field signal / competitive differentiator
+    "rice::competitor-parity": 24.0,     # Multiple escalations / win-loss mentions
+}
 
 
 def _adf_doc(*paragraphs: dict) -> dict:
@@ -1106,6 +1185,121 @@ def post_jira_comment(
     return resp.status_code in (200, 201)
 
 
+PROXY_CONFIDENCE_CAP = 0.60
+
+
+def enforce_reach_labels(
+    session: requests.Session,
+    jira_url: str,
+    api_version: str,
+    features: List[dict],
+    reach_by_key: Dict[str, Optional[float]],
+    labels_by_key: Dict[str, List[str]],
+    reach_field: str,
+    do_apply: bool,
+    pm_field: str,
+) -> int:
+    """Enforce Reach field value based on rice:: reach-tier labels.
+
+    For every feature that carries a label in REACH_LABEL_MAP, the Reach field
+    must equal the label-defined value.  When there is a mismatch *and* do_apply
+    is True, this function updates the Reach field in Jira, mutates *reach_by_key*
+    so the corrected value flows into the ranking, and posts a comment mentioning
+    both the assignee and the product manager.
+
+    If a feature has multiple rice:: reach labels (misconfiguration), the highest
+    value wins.  Returns the number of corrections applied (or that would be applied
+    in dry-run mode).
+    """
+    enforced = 0
+
+    print(f"\n🏷️  Reach label enforcement (rice:: labels):")
+
+    any_label_found = False
+    for issue in features:
+        key = (issue.get("key") or "").strip()
+        if not key:
+            continue
+        fields = issue.get("fields") or {}
+        labels = labels_by_key.get(key, [])
+
+        reach_labels = [lb for lb in labels if lb in REACH_LABEL_MAP]
+        if not reach_labels:
+            continue
+
+        any_label_found = True
+        expected_reach = max(REACH_LABEL_MAP[lb] for lb in reach_labels)
+        current_reach = reach_by_key.get(key)
+
+        if current_reach is not None and abs(current_reach - expected_reach) < 0.01:
+            continue  # Already correct
+
+        label_str = reach_labels[0] if len(reach_labels) == 1 else f"{reach_labels} (multiple — use only one)"
+        current_str = str(current_reach) if current_reach is not None else "not set"
+        enforced += 1
+
+        print(
+            f"   {'✅' if do_apply else '🔍'} {key}: Reach {current_str} → {expected_reach}"
+            f"  (label: {label_str})"
+        )
+
+        if not do_apply:
+            continue
+
+        if not reach_field:
+            print(f"   ⚠️  Reach field ID unknown — cannot update {key}")
+            continue
+
+        url = f"{jira_url.rstrip('/')}/rest/api/{api_version}/issue/{key}"
+        resp = session.put(
+            url,
+            json={"fields": {reach_field: expected_reach}},
+            params={"notifyUsers": "false"},
+            timeout=30,
+        )
+        if resp.status_code not in (200, 204):
+            print(f"   ⚠️  Reach field update failed for {key}: {resp.status_code}")
+            continue
+
+        reach_by_key[key] = expected_reach
+
+        assignee = fields.get("assignee") or {}
+        pm = fields.get(pm_field) or {}
+        assignee_id = assignee.get("accountId", "")
+        assignee_name = assignee.get("displayName", "assignee")
+        pm_id = pm.get("accountId", "")
+        pm_name = pm.get("displayName", "product manager")
+
+        inline: List[dict] = []
+        if assignee_id:
+            inline.append(_adf_mention(assignee_id, assignee_name))
+        if pm_id and pm_id != assignee_id:
+            if inline:
+                inline.append(_adf_text(" "))
+            inline.append(_adf_mention(pm_id, pm_name))
+        elif not assignee_id and pm_id:
+            inline.append(_adf_mention(pm_id, pm_name))
+        inline.append(_adf_text(
+            f" the Reach score has been automatically corrected from {current_str} to"
+            f" {expected_reach} based on the label '{label_str}'."
+            f" Per the RHACS RICE rubric, '{label_str}' sets Reach = {expected_reach}."
+            f" If this label is incorrect for this feature, please update it."
+            f" Note: recalculate the RICE Score field if it does not update automatically."
+        ))
+        if inline:
+            body = _adf_doc(_adf_para(*inline))
+            post_jira_comment(session, jira_url, api_version, key, body)
+
+    if not any_label_found:
+        print("   ℹ️  No features have rice:: reach-tier labels")
+    elif enforced == 0:
+        print("   ✅ All labeled features have correct Reach values")
+    elif not do_apply:
+        print(f"   💡 {enforced} mismatch(es) found — run with --apply to correct")
+
+    return enforced
+
+
 def validate_data_quality(
     session: requests.Session,
     jira_url: str,
@@ -1115,14 +1309,19 @@ def validate_data_quality(
     labels_by_key: Dict[str, List[str]],
     target_version: str,
     do_comment: bool,
-) -> Tuple[int, int]:
-    """Validate RICE Score presence and TV label correctness for all cohort features.
+    confidence_by_key: Optional[Dict[str, Optional[float]]] = None,
+    reach_method_by_key: Optional[Dict[str, Optional[str]]] = None,
+    discovery_notified: Optional[Dict[str, bool]] = None,
+) -> Tuple[int, int, int]:
+    """Validate RICE Score presence, TV label correctness, and Proxy-Based Confidence cap.
 
     Posts a Jira comment mentioning the assignee (or PM) for each violation when
-    *do_comment* is True.  Returns (rice_violations, tv_violations).
+    *do_comment* is True.  Returns (rice_violations, tv_violations, proxy_conf_violations).
     """
     rice_violations: List[str] = []
     tv_violations: List[str] = []
+    proxy_conf_violations: List[str] = []
+    discovery_violations: List[str] = []
     commented: List[str] = []
 
     for issue in features:
@@ -1201,6 +1400,89 @@ def validate_data_quality(
                 else:
                     print(f"   ⚠️  Comment failed for {key} (TV label mismatch)")
 
+        # --- Validation 3: Proxy-Based Reach with Confidence > 60% ---
+        if reach_method_by_key is not None and confidence_by_key is not None:
+            reach_method = reach_method_by_key.get(key)
+            conf = confidence_by_key.get(key)
+            if (
+                reach_method is not None
+                and "proxy" in reach_method.lower()
+                and conf is not None
+                and conf > PROXY_CONFIDENCE_CAP
+            ):
+                proxy_conf_violations.append(key)
+                if do_comment:
+                    assignee_id = assignee.get("accountId", "")
+                    assignee_name = assignee.get("displayName", "assignee")
+                    pm_id = pm.get("accountId", "")
+                    pm_name = pm.get("displayName", "product manager")
+                    conf_str = f"{round(conf * 100)}%"
+                    inline: List[dict] = []
+                    if assignee_id:
+                        inline.append(_adf_mention(assignee_id, assignee_name))
+                    if pm_id and pm_id != assignee_id:
+                        if inline:
+                            inline.append(_adf_text(" "))
+                        inline.append(_adf_mention(pm_id, pm_name))
+                    inline.append(_adf_text(
+                        f" this feature uses Proxy-Based Reach but has Confidence set to"
+                        f" {conf_str}. Per the RHACS RICE scoring rubric, Proxy-Based Reach"
+                        f" requires Confidence ≤ 60% (50% Low) because there is no telemetry"
+                        f" to validate the estimate — uncertainty must be expressed through"
+                        f" Confidence, not inflated with unsupported assumptions."
+                        f" Please lower Confidence to '50% (Low)', or switch to ARR-Based"
+                        f" or Footprint-Based Reach if you have supporting data."
+                    ))
+                    if inline:
+                        body = _adf_doc(_adf_para(*inline))
+                        if post_jira_comment(session, jira_url, api_version, key, body):
+                            if key not in commented:
+                                commented.append(key)
+                        else:
+                            print(f"   ⚠️  Comment failed for {key} (Proxy+Confidence)")
+
+        # --- Validation 4: Confidence = 50% (Low) → discovery candidate ---
+        # Comment fires once per feature; suppressed on repeat runs until confidence changes.
+        if confidence_by_key is not None:
+            conf = confidence_by_key.get(key)
+            if conf is not None and abs(conf - 0.5) < 0.01:
+                discovery_violations.append(key)
+                already_notified = (
+                    discovery_notified is not None and discovery_notified.get(key, False)
+                )
+                if do_comment and not already_notified:
+                    assignee_id = assignee.get("accountId", "")
+                    assignee_name = assignee.get("displayName", "assignee")
+                    pm_id = pm.get("accountId", "")
+                    pm_name = pm.get("displayName", "product manager")
+                    inline2: List[dict] = []
+                    if assignee_id:
+                        inline2.append(_adf_mention(assignee_id, assignee_name))
+                    if pm_id and pm_id != assignee_id:
+                        if inline2:
+                            inline2.append(_adf_text(" "))
+                        inline2.append(_adf_mention(pm_id, pm_name))
+                    elif not assignee_id and pm_id:
+                        inline2.append(_adf_mention(pm_id, pm_name))
+                    inline2.append(_adf_text(
+                        f" this feature has Confidence set to 50% (Low), which signals"
+                        f" significant uncertainty — the team does not yet have enough"
+                        f" information to confidently commit this to the {target_version}"
+                        f" backlog. Please consider treating this as a *discovery item*:"
+                        f" validate the problem with customers, gather supporting data or"
+                        f" telemetry, and refine scope before scheduling. If you have"
+                        f" evidence that supports higher confidence, update the score and"
+                        f" document the rationale."
+                    ))
+                    body = _adf_doc(_adf_para(*inline2))
+                    if post_jira_comment(session, jira_url, api_version, key, body):
+                        if key not in commented:
+                            commented.append(key)
+                        if discovery_notified is not None:
+                            discovery_notified[key] = True
+                    else:
+                        print(f"   ⚠️  Comment failed for {key} (discovery flag)")
+
     # --- Summary ---
     print(f"\n🔍 Data quality ({target_version} cohort):")
     if rice_violations:
@@ -1211,12 +1493,28 @@ def validate_data_quality(
         print(f"   ❌ TV label issues ({len(tv_violations)}): {', '.join(tv_violations)}")
     else:
         print(f'   ✅ All features have exactly one "{target_version}" label')
+    if reach_method_by_key is not None and confidence_by_key is not None:
+        if proxy_conf_violations:
+            print(
+                f"   ❌ Proxy-Based Reach with Confidence > 60%"
+                f" ({len(proxy_conf_violations)}): {', '.join(proxy_conf_violations)}"
+            )
+        else:
+            print("   ✅ All Proxy-Based features have Confidence ≤ 60%")
+    if confidence_by_key is not None:
+        if discovery_violations:
+            print(
+                f"   🔭 Discovery candidates — Confidence 50% (Low)"
+                f" ({len(discovery_violations)}): {', '.join(discovery_violations)}"
+            )
+        else:
+            print("   ✅ No features flagged as discovery candidates")
     if do_comment and commented:
         print(f"   💬 Jira comments posted on {len(commented)} issue(s): {', '.join(commented)}")
-    elif not do_comment and (rice_violations or tv_violations):
+    elif not do_comment and (rice_violations or tv_violations or proxy_conf_violations or discovery_violations):
         print("   💡 Run with --apply to post Jira comments to assignees")
 
-    return len(rice_violations), len(tv_violations)
+    return len(rice_violations), len(tv_violations), len(proxy_conf_violations), len(discovery_violations)
 
 
 def _get_in_progress_transition_id(
@@ -1310,6 +1608,165 @@ def auto_progress_features(
     return transitioned
 
 
+# Status gate requirements derived from the feature workflow table.
+# Only statuses with mandatory gate checks are listed; others are skipped.
+# "comment": False → flag in console summary only, never post a Jira comment
+# (use for systemic/bulk issues that are better addressed in a team meeting).
+_STATUS_GATES: Dict[str, Dict[str, Any]] = {
+    # Being in a release cohort means PM has scoped it — "New" should be Backlog or higher.
+    # Suppressed as a Jira comment: this is a bulk process gap, not an individual action item.
+    "New": {"warn_in_cohort": True, "comment": False},
+    # ToDo gate: 3-in-a-box complete, RICE scored, eng contact set.
+    "ToDo": {"requires_rice": True, "requires_assignee": True, "comment": True},
+    # Active development and beyond must also satisfy these gates.
+    "In Progress": {"requires_rice": True, "requires_assignee": True, "comment": True},
+    "In Review": {"requires_rice": True, "requires_assignee": True, "comment": True},
+    "Release Pending": {"requires_rice": True, "requires_assignee": True, "comment": True},
+}
+
+
+def validate_status_gates(
+    session: requests.Session,
+    jira_url: str,
+    api_version: str,
+    features: List[dict],
+    rice_by_key: Dict[str, Optional[float]],
+    target_version: str,
+    do_comment: bool,
+    pm_field: str,
+) -> int:
+    """Check that each feature's status is consistent with its workflow gate requirements.
+
+    Gate rules (from the feature workflow):
+    - New in a version cohort: should be moved to Backlog (already in scope).
+    - ToDo: must have RICE score AND an engineering Assignee.
+    - In Progress / In Review / Release Pending: same requirements.
+
+    Posts one consolidated Jira comment per violating feature (mentioning assignee
+    and PM) when *do_comment* is True.  Returns the total number of violations.
+    """
+    violations_by_key: Dict[str, List[str]] = {}
+    commented: List[str] = []
+
+    for issue in features:
+        key = (issue.get("key") or "").strip()
+        if not key:
+            continue
+        fields = issue.get("fields") or {}
+        status = (fields.get("status") or {}).get("name") or ""
+        gates = _STATUS_GATES.get(status)
+        if not gates:
+            continue
+
+        rice = rice_by_key.get(key)
+        assignee = fields.get("assignee") or {}
+        has_assignee = bool(assignee.get("accountId"))
+        msgs: List[str] = []
+
+        if gates.get("warn_in_cohort"):
+            msgs.append(
+                f" this feature is in the {target_version} release scope but its status is"
+                f" still 'New'. 'New' means not yet prioritized. If it has been reviewed and"
+                f" added to the release scope, please move it to 'Backlog'. If it is not yet"
+                f" confirmed for {target_version}, remove the Target Version."
+            )
+
+        if gates.get("requires_rice") and rice is None:
+            msgs.append(
+                f" this feature is in '{status}' status but is missing a RICE Score."
+                f" Per the feature workflow, a RICE score must be assigned before a feature"
+                f" reaches 'ToDo'. Please fill in Reach, Impact, Confidence, and Effort."
+            )
+
+        if gates.get("requires_assignee") and not has_assignee:
+            msgs.append(
+                f" this feature is in '{status}' status but has no Assignee."
+                f" Per the feature workflow, an engineering contact must be set as Assignee"
+                f" before a feature reaches 'ToDo'. Please assign the engineering lead."
+            )
+
+        if not msgs:
+            continue
+
+        violations_by_key[key] = msgs
+
+        if do_comment and gates.get("comment", True):
+            pm = fields.get(pm_field) or {}
+            assignee_id = assignee.get("accountId", "")
+            assignee_name = assignee.get("displayName", "assignee")
+            pm_id = pm.get("accountId", "")
+            pm_name = pm.get("displayName", "product manager")
+
+            paragraphs: List[dict] = []
+            for i, msg in enumerate(msgs):
+                inline: List[dict] = []
+                if i == 0:
+                    if assignee_id:
+                        inline.append(_adf_mention(assignee_id, assignee_name))
+                    if pm_id and pm_id != assignee_id:
+                        if inline:
+                            inline.append(_adf_text(" "))
+                        inline.append(_adf_mention(pm_id, pm_name))
+                    elif not assignee_id and pm_id:
+                        inline.append(_adf_mention(pm_id, pm_name))
+                inline.append(_adf_text(msg))
+                paragraphs.append(_adf_para(*inline))
+
+            if paragraphs and (assignee_id or pm_id):
+                body = _adf_doc(*paragraphs)
+                if post_jira_comment(session, jira_url, api_version, key, body):
+                    commented.append(key)
+                else:
+                    print(f"   ⚠️  Comment failed for {key} (status gate: {status})")
+
+    total_violations = sum(len(v) for v in violations_by_key.values())
+    print(f"\n🚦 Status gate validation ({target_version} cohort):")
+    if not violations_by_key:
+        print("   ✅ All features meet their status gate requirements")
+    else:
+        # Group by status for compact output; suppress per-item lines for comment=False statuses.
+        by_status: Dict[str, List[str]] = {}
+        for key, msgs in violations_by_key.items():
+            st = ((next(
+                (iss.get("fields") or {}) for iss in features if iss.get("key") == key
+            ) or {}).get("status") or {}).get("name", "?")
+            by_status.setdefault(st, []).append(key)
+
+        for st, keys in sorted(by_status.items()):
+            gate = _STATUS_GATES.get(st, {})
+            if not gate.get("comment", True):
+                # Bulk-suppress: one summary line, no per-feature noise.
+                continue
+            for key in sorted(keys):
+                msgs = violations_by_key[key]
+                print(f"   ❌ {key} [{st}]: {len(msgs)} violation(s)")
+                for msg in msgs:
+                    print(f"      • {msg.strip()[:100]}")
+    comment_eligible = sum(
+        1 for k, msgs in violations_by_key.items()
+        if _STATUS_GATES.get(
+            ((next((iss.get("fields") or {} for iss in features if iss.get("key") == k), None) or {})
+             .get("status") or {}).get("name", ""), {}
+        ).get("comment", True)
+    )
+    if do_comment and commented:
+        print(f"   💬 Status gate comments posted on {len(commented)} issue(s): {', '.join(commented)}")
+    elif not do_comment and comment_eligible:
+        print("   💡 Run with --apply to post Jira comments on ToDo/In Progress/In Review violations")
+    new_count = sum(
+        1 for k in violations_by_key
+        if ((next((iss.get("fields") or {} for iss in features if iss.get("key") == k), None) or {})
+            .get("status") or {}).get("name") == "New"
+    )
+    if new_count:
+        print(
+            f"   ℹ️  {new_count} 'New' status feature(s) flagged (comment suppressed — address in"
+            f" sprint review or Scrum of Scrums)"
+        )
+
+    return total_violations
+
+
 def sync_rank_position_labels(
     session: requests.Session,
     jira_url: str,
@@ -1318,11 +1775,11 @@ def sync_rank_position_labels(
     labels_by_key: Dict[str, List[str]],
     date_str: str,
 ) -> int:
-    """Add/update ``rice-rank-NN_YYYYMMDD`` label on each cohort issue."""
+    """Add/update ``rice::rank-NN_YYYYMMDD`` label on each cohort issue."""
     updated = 0
     for pos_0, key in enumerate(cohort_keys_ordered):
         pos = pos_0 + 1
-        new_label = f"rice-rank-{pos}_{date_str}"
+        new_label = f"rice::rank-{pos}_{date_str}"
         current = labels_by_key.get(key, [])
         old_rank_labels = [lb for lb in current if RANK_LABEL_RE.match(lb)]
         if old_rank_labels == [new_label]:
@@ -1520,7 +1977,10 @@ def main() -> int:
             return 1
         print(f"🔍 Cohort ({args.cohort}): {cohort_jql}")
 
-    reach_field = (validator.rice_field_ids().get("reach") or "").strip()
+    rice_field_ids = validator.rice_field_ids()
+    reach_field = (rice_field_ids.get("reach") or "").strip()
+    confidence_field = (rice_field_ids.get("confidence") or "").strip()
+    reach_method_field = (rice_field_ids.get("reach_method") or "").strip()
     pm_field = os.getenv("JIRA_PRODUCT_MANAGER_FIELD", "customfield_10469")
     fields_param = f"labels,{rank_field},{rice_field},assignee,{pm_field},status"
     if not args.ignore_links:
@@ -1529,6 +1989,14 @@ def main() -> int:
         fields_param += f",{reach_field}"
     else:
         print("   ⚠️  Reach field not found — tie-break by Reach disabled")
+    if confidence_field:
+        fields_param += f",{confidence_field}"
+    else:
+        print("   ⚠️  Confidence field not found — Proxy-Based confidence check disabled")
+    if reach_method_field:
+        fields_param += f",{reach_method_field}"
+    else:
+        print("   ⚠️  Reach Method field not found — Proxy-Based confidence check disabled")
     try:
         features = fetch_cohort_features(
             validator.session,
@@ -1550,6 +2018,9 @@ def main() -> int:
         return 0
     rice_by_key: Dict[str, Optional[float]] = {}
     reach_by_key: Dict[str, Optional[float]] = {}
+    confidence_by_key: Dict[str, Optional[float]] = {}
+    reach_method_by_key: Dict[str, Optional[str]] = {}
+    status_by_key: Dict[str, Optional[str]] = {}
     lexo_by_key: Dict[str, str] = {}
     labels_by_key: Dict[str, List[str]] = {}
 
@@ -1559,6 +2030,11 @@ def main() -> int:
         rice_by_key[key] = _parse_rice_score(fields.get(rice_field))
         if reach_field:
             reach_by_key[key] = _parse_reach_score(fields.get(reach_field))
+        if confidence_field:
+            confidence_by_key[key] = _parse_confidence_pct(fields.get(confidence_field))
+        if reach_method_field:
+            reach_method_by_key[key] = _parse_reach_method(fields.get(reach_method_field))
+        status_by_key[key] = (fields.get("status") or {}).get("name")
         lexo_by_key[key] = (fields.get(rank_field) or "").strip()
         labels_by_key[key] = list(fields.get("labels") or [])
 
@@ -1567,6 +2043,21 @@ def main() -> int:
         blocks_map = build_blocks_map(features, set(rice_by_key.keys()))
 
     api_ver = "3" if is_cloud else "2"
+    enforce_reach_labels(
+        validator.session,
+        validator.jira_url,
+        api_ver,
+        features,
+        reach_by_key,
+        labels_by_key,
+        reach_field,
+        do_apply,
+        pm_field,
+    )
+    # Load previously-notified discovery features (bool markers).
+    # Entries are cleared when a feature's confidence changes away from 50%.
+    _raw_notified = bucket.get("discovery_notified") or {}
+    discovery_notified: Dict[str, bool] = {k: bool(v) for k, v in _raw_notified.items()}
     validate_data_quality(
         validator.session,
         validator.jira_url,
@@ -1576,6 +2067,28 @@ def main() -> int:
         labels_by_key,
         args.target_version,
         do_comment=do_apply,
+        confidence_by_key=confidence_by_key if confidence_field else None,
+        reach_method_by_key=reach_method_by_key if reach_method_field else None,
+        discovery_notified=discovery_notified,
+    )
+    # Persist: keep only features that are still in the cohort and still at 50% confidence.
+    cohort_keys = set(rice_by_key.keys())
+    bucket["discovery_notified"] = {
+        k: True for k, v in discovery_notified.items()
+        if v
+        and k in cohort_keys
+        and confidence_by_key.get(k) is not None
+        and abs((confidence_by_key.get(k) or 0.0) - 0.5) < 0.01
+    }
+    validate_status_gates(
+        validator.session,
+        validator.jira_url,
+        api_ver,
+        features,
+        rice_by_key,
+        args.target_version,
+        do_comment=do_apply,
+        pm_field=pm_field,
     )
     auto_progress_features(
         validator.session,
@@ -1652,7 +2165,7 @@ def main() -> int:
             skipped_no_rice.append(key)
         auto_keys.append(key)
 
-    ascending = sort_keys_by_rice_asc(auto_keys, rice_by_key, reach_by_key or None)
+    ascending = sort_keys_by_rice_asc(auto_keys, rice_by_key, reach_by_key or None, status_by_key)
     ordered = list(reversed(ascending))  # display: highest RICE first
     ordered, link_promotions = promote_blockers(ordered, blocks_map)
 
@@ -1661,6 +2174,7 @@ def main() -> int:
     print(
         f"   Ranked by RICE"
         + (" + Reach tie-break" if reach_field else "")
+        + " + GA/In-Progress boost"
         + f" (incl. no-score at bottom): {len(ordered)}"
     )
     print(f"   Skipped (manual lock): {len(skipped_manual)}")
@@ -1688,7 +2202,9 @@ def main() -> int:
     for i, key in enumerate(ordered[:25], 1):
         reach_s = reach_by_key.get(key) if reach_field else None
         extra = f"  Reach={reach_s}" if reach_s is not None else ""
-        print(f"      {i:3}. {key}  RICE={rice_by_key[key]}{extra}")
+        st_name = status_by_key.get(key) or ""
+        st_tag = f"  [{st_name}]" if st_name and _status_tier(st_name) < 2 else ""
+        print(f"      {i:3}. {key}  RICE={rice_by_key[key]}{extra}{st_tag}")
     if len(ordered) > 25:
         print(f"      … and {len(ordered) - 25} more")
 
@@ -1735,6 +2251,7 @@ def main() -> int:
                 dry_run=True,
                 reach_by_key=reach_for_sort,
                 blocks_map=blocks_map,
+                status_by_key=status_by_key,
             )
         else:
             apply_rice_rank_order(
@@ -1749,6 +2266,7 @@ def main() -> int:
                 rank_view=args.rank_view,
                 reach_by_key=reach_for_sort,
                 blocks_map=blocks_map,
+                status_by_key=status_by_key,
             )
         print("\n💡 Dry run — use --apply to update Rank in Jira")
         return 0
@@ -1766,6 +2284,7 @@ def main() -> int:
             rice_field,
             is_cloud,
             reach_field,
+            exclude_keys=label_anchors,
         )
 
     if args.only_if_changed and not rice_changes and misaligned_before == 0:
@@ -1801,6 +2320,7 @@ def main() -> int:
             dry_run=False,
             reach_by_key=reach_for_sort,
             blocks_map=blocks_map,
+            status_by_key=status_by_key,
         )
     else:
         ok, msg = apply_rice_rank_order(
@@ -1815,6 +2335,7 @@ def main() -> int:
             rank_view=args.rank_view,
             reach_by_key=reach_for_sort,
             blocks_map=blocks_map,
+            status_by_key=status_by_key,
         )
     if not ok:
         print(f"   ❌ Rank update failed: {msg}")
@@ -1849,6 +2370,18 @@ def main() -> int:
         if key in refreshed:
             issue["fields"] = {**(issue.get("fields") or {}), **refreshed[key]}
 
+    # After a successful --force-rank, clear state locks so the next run doesn't re-accumulate them.
+    if force_state and state_locked:
+        cleared_count = 0
+        for key in state_locked:
+            entry = issue_state_entry(bucket, key)
+            if entry.get("manual_override") and not (entry.get("manual_reason") or "").startswith("label:"):
+                entry["manual_override"] = False
+                entry.pop("manual_reason", None)
+                cleared_count += 1
+        if cleared_count:
+            print(f"   🔓 Cleared {cleared_count} state lock(s) after --force-rank (positions now synced)")
+
     update_state_from_features(bucket, features, rice_field, rank_field)
     save_state(state_path, state)
     print(f"\n💾 State saved: {state_path}")
@@ -1861,6 +2394,7 @@ def main() -> int:
         rice_field,
         is_cloud,
         reach_field,
+        exclude_keys=label_anchors,
     )
     if misaligned:
         print(

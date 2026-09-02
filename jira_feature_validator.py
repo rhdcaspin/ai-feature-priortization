@@ -126,6 +126,7 @@ class JiraFeatureValidator:
         "impact": ["Impact (migrated)", "Impact"],
         "confidence": ["Confidence"],
         "effort": ["Effort"],
+        "reach_method": ["Reach Method"],
     }
 
     def _discover_rice_fields(self) -> Dict[str, str]:
@@ -168,6 +169,7 @@ class JiraFeatureValidator:
             "impact": os.getenv("JIRA_RICE_IMPACT_FIELD", "").strip(),
             "confidence": os.getenv("JIRA_RICE_CONFIDENCE_FIELD", "").strip(),
             "effort": os.getenv("JIRA_RICE_EFFORT_FIELD", "").strip(),
+            "reach_method": os.getenv("JIRA_RICE_REACH_METHOD_FIELD", "").strip(),
         }
         if all(env_ids.values()):
             self._rice_cache = env_ids
